@@ -8,7 +8,6 @@ services:
       - "${PORT}:${PORT}"
     depends_on:
       - mongodb
-      - searxng-core
       - rag_api
     image: registry.librechat.ai/danny-avila/librechat-dev:latest
     restart: always
@@ -18,8 +17,8 @@ services:
     env_file:
       - .env
     environment:
-      - SEARXNG_INSTANCE_URL=${SEARXNG_INSTANCE_URL}
-      - SEARXNG_API_KEY=${SEARXNG_API_KEY}
+      - SEARXNG_INSTANCE_URL=http://searxng-core:8099
+      - SEARXNG_API_KEY=
       - FIRECRAWL_API_KEY=${FIRECRAWL_API_KEY}
       - FIRECRAWL_API_URL=${FIRECRAWL_API_URL}
       - HOST=0.0.0.0

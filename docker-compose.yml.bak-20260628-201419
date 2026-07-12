@@ -8,7 +8,6 @@ services:
       - "${PORT}:${PORT}"
     depends_on:
       - mongodb
-      - searxng-core
       - rag_api
     image: registry.librechat.ai/danny-avila/librechat-dev:latest
     restart: always
@@ -18,10 +17,6 @@ services:
     env_file:
       - .env
     environment:
-      - SEARXNG_INSTANCE_URL=${SEARXNG_INSTANCE_URL}
-      - SEARXNG_API_KEY=${SEARXNG_API_KEY}
-      - FIRECRAWL_API_KEY=${FIRECRAWL_API_KEY}
-      - FIRECRAWL_API_URL=${FIRECRAWL_API_URL}
       - HOST=0.0.0.0
       - MONGO_URI=mongodb://mongodb:27017/LibreChat
       - MEILI_HOST=http://meilisearch:7700
@@ -57,7 +52,6 @@ services:
       - /mnt/openwebui/www/html/cdn/assets/loop/web-app-manifest-512x512.png:/app/client/dist/assets/maskable-icon.png:ro
       - ./loop-whitelabel/manifest.webmanifest:/app/client/public/manifest.webmanifest:ro
       - ./loop-whitelabel/manifest.webmanifest:/app/client/dist/manifest.webmanifest:ro
-      - ./loop-whitelabel/index.html:/app/client/dist/index.html:ro
   admin-panel:
     container_name: admin-panel
     image: registry.librechat.ai/clickhouse/librechat-admin-panel:latest
