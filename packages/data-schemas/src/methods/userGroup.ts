@@ -239,6 +239,8 @@ export function createUserGroupMethods(
     memberId: string,
     session?: ClientSession,
   ) => Promise<IGroup | null>;
+  addMemberToLocalGroup: (name: string, memberId: string, tenantId?: string) => Promise<IGroup>;
+  removeMemberFromLocalGroup: (name: string, memberId: string, tenantId?: string) => Promise<void>;
 } {
   const getPrincipalsCache = (): CacheStore | undefined =>
     deps.getCache?.(CacheKeys.USER_PRINCIPALS);
@@ -1328,6 +1330,55 @@ export function createUserGroupMethods(
     return group;
   }
 
+  async function addMemberToLocalGroup(
+    name: string,
+    memberId: string,
+    tenantId?: string,
+  ): Promise<IGroup> {
+    const Group = mongoose.models.Group as Model<IGroup>;
+    const tenantFilter = tenantId ? { tenantId } : { tenantId: { $exists: false } };
+    const update = {
+      $set: { managedBy: 'axiom' },
+      $setOnInsert: { name, source: 'local', ...(tenantId ? { tenantId } : {}) },
+      $addToSet: { memberIds: memberId },
+    };
+    let group: IGroup | null;
+    try {
+      group = await Group.findOneAndUpdate({ name, source: 'local', ...tenantFilter }, update, {
+        new: true,
+        upsert: true,
+      }).lean<IGroup>();
+    } catch (error) {
+      if (!(error instanceof Error) || !('code' in error) || error.code !== 11000) {
+        throw error;
+      }
+      group = await Group.findOneAndUpdate(
+        { managedBy: 'axiom', source: 'local', ...tenantFilter },
+        { $set: { name }, $addToSet: { memberIds: memberId } },
+        { new: true },
+      ).lean<IGroup>();
+    }
+    if (!group) {
+      throw new Error('Failed to create or update local group');
+    }
+    await invalidateMemberGroupsCache([memberId]);
+    return group;
+  }
+
+  async function removeMemberFromLocalGroup(
+    name: string,
+    memberId: string,
+    tenantId?: string,
+  ): Promise<void> {
+    const Group = mongoose.models.Group as Model<IGroup>;
+    const tenantFilter = tenantId ? { tenantId } : { tenantId: { $exists: false } };
+    await Group.updateOne(
+      { name, source: 'local', managedBy: 'axiom', ...tenantFilter },
+      { $pull: { memberIds: memberId } },
+    );
+    await invalidateMemberGroupsCache([memberId]);
+  }
+
   return {
     findGroupById,
     findGroupByExternalId,
@@ -1352,6 +1403,8 @@ export function createUserGroupMethods(
     countGroups,
     deleteGroup,
     removeMemberById,
+    addMemberToLocalGroup,
+    removeMemberFromLocalGroup,
   };
 }
 

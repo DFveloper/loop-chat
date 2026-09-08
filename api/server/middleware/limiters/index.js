@@ -14,6 +14,7 @@ const resetPasswordLimiter = require('./resetPasswordLimiter');
 const twoFactorTempLimiter = require('./twoFactorTempLimiter');
 const verifyEmailSubmissionLimiter = require('./verifyEmailSubmissionLimiter');
 const resetPasswordSubmissionLimiter = require('./resetPasswordSubmissionLimiter');
+const axiomRedeemLimiters = require('./axiomRedeemLimiter');
 
 module.exports = {
   ...uploadLimiters,
@@ -31,4 +32,5 @@ module.exports = {
   verifyEmailSubmissionLimiter,
   resetPasswordSubmissionLimiter,
   twoFactorTempLimiter,
+  ...axiomRedeemLimiters,
 };

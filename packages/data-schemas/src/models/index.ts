@@ -31,6 +31,7 @@ import { createTokenModel } from './token';
 import { createAgentModel } from './agent';
 import { createSkillModel } from './skill';
 import { createGroupModel } from './group';
+import { createAxiomInviteModel } from './axiomInvite';
 import { createUserModel } from './user';
 import { createRoleModel } from './role';
 import { createFileModel } from './file';
@@ -77,6 +78,7 @@ export function createModels(mongoose: typeof import('mongoose')): {
   AuditLog: ReturnType<typeof createAuditLogModel>;
   Group: ReturnType<typeof createGroupModel>;
   Config: ReturnType<typeof createConfigModel>;
+  AxiomInvite: ReturnType<typeof createAxiomInviteModel>;
 } {
   return {
     User: createUserModel(mongoose),
@@ -116,5 +118,6 @@ export function createModels(mongoose: typeof import('mongoose')): {
     AuditLog: createAuditLogModel(mongoose),
     Group: createGroupModel(mongoose),
     Config: createConfigModel(mongoose),
+    AxiomInvite: createAxiomInviteModel(mongoose),
   };
 }

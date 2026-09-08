@@ -101,6 +101,7 @@ import type {
 import { createAgentMethods, type AgentMethods, type AgentDeps } from './agent';
 /* Config */
 import { createConfigMethods, type ConfigMethods } from './config';
+import { createAxiomInviteMethods, type AxiomInviteMethods } from './axiomInvite';
 
 export { RoleConflictError, DEFAULT_REFRESH_TOKEN_EXPIRY, DEFAULT_SESSION_EXPIRY };
 export { tokenValues, cacheTokenValues, premiumTokenValues, defaultRate, createTxMethods };
@@ -153,7 +154,8 @@ export type AllMethods = UserMethods &
   SkillMethods &
   SkillSyncMethods &
   AgentMethods &
-  ConfigMethods;
+  ConfigMethods &
+  AxiomInviteMethods;
 
 /** Dependencies injected from the api layer into createMethods */
 export interface CreateMethodsDeps {
@@ -288,11 +290,13 @@ export function createMethods(
     ...agentMethods,
     /* Config */
     ...createConfigMethods(mongoose),
+    ...createAxiomInviteMethods(mongoose),
   };
 }
 
 export type {
   UserMethods,
+  AxiomInviteMethods,
   SessionMethods,
   TokenMethods,
   RoleMethods,

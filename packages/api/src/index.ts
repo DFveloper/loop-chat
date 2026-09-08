@@ -6,6 +6,7 @@ export * from './admin';
 export * from './cdn';
 /* Auth */
 export * from './auth';
+export * from './axiom';
 /* API Keys */
 export * from './apiKeys';
 /* MCP */

@@ -1,5 +1,6 @@
 import React, { memo, useState } from 'react';
 import { AlertCircle } from 'lucide-react';
+import { cn, getThemeAwareBrandLogoClass } from '~/utils';
 import { icons } from '~/hooks/Endpoint/Icons';
 
 export const URLIcon = memo(
@@ -51,7 +52,7 @@ export const URLIcon = memo(
           src={iconURL}
           alt={altName ?? 'Icon'}
           style={imageStyle}
-          className="object-cover"
+          className={cn('object-cover transition-[filter]', getThemeAwareBrandLogoClass(iconURL))}
           onError={handleImageError}
           loading="lazy"
           decoding="async"

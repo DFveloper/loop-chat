@@ -514,6 +514,9 @@ export type TRegisterUser = {
   token?: string;
 };
 
+export type TAxiomRedeemRequest = { key: string };
+export type TAxiomSessionResponse = { valid: boolean };
+
 export type TLoginUser = {
   email: string;
   password: string;

@@ -45,6 +45,10 @@ const groupSchema: Schema<IGroup> = new Schema<IGroup>(
       type: String,
       index: true,
     },
+    managedBy: {
+      type: String,
+      enum: ['axiom'],
+    },
   },
   { timestamps: true },
 );
@@ -57,5 +61,9 @@ groupSchema.index(
   },
 );
 groupSchema.index({ memberIds: 1 });
+groupSchema.index(
+  { managedBy: 1, tenantId: 1 },
+  { unique: true, partialFilterExpression: { managedBy: 'axiom' } },
+);
 
 export default groupSchema;

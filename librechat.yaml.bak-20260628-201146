@@ -94,7 +94,7 @@ fileStrategy: "local"
 
 # Custom interface configuration
 interface:
-  customWelcome: 'Welcome to LOOP Chat! Enjoy your experience.'
+  customWelcome: 'Welcome to Aeonthic! Enjoy your experience.'
   # Enable/disable file search as a chatarea selection (default: true)
   # Note: This setting does not disable the Agents File Search Capability.
   # To disable the Agents Capability, see the Agents Endpoint configuration instead.
@@ -109,9 +109,9 @@ interface:
     externalUrl: 'https://librechat.ai/tos'
     openNewTab: true
     modalAcceptance: true
-    modalTitle: 'Terms of Service for LOOP Chat'
+    modalTitle: 'Terms of Service for Aeonthic'
     modalContent: |
-      # Terms and Conditions for LOOP Chat
+      # Terms and Conditions for Aeonthic
 
       *Effective Date: February 18, 2024*
 
@@ -524,7 +524,7 @@ endpoints:
     # gateways (e.g. AI gateways, OpenCode Zen). The `baseURL` must be the API root
     # the Anthropic SDK appends `/v1/messages` to. List models explicitly: model
     # auto-fetch uses the OpenAI `/models` convention and is not used for this provider.
-    - name: "LOOP"
+    - name: "Aeonthic"
       apiKey: "sk-S91VjzyukT8qTxqBTwuiIsbzEa6xsdqXqZ-RUAyh6SE"
       softDefault: true
       showOnLanding: true
@@ -558,7 +558,7 @@ endpoints:
 #    - name: 'AIKAR 3.2 Pro'
 #      label: 'AIKAR 3.2 Pro'
 #      softDefault: true
-#      description: "LOOP의 최신 플래그쉽 LLM"
+#      description: "Aeonthic의 최신 플래그쉽 LLM"
 #      iconURL: 'https://cdn.dfveloper.com/assets/aikar/logo-white.png'
 #      showOnLanding: true
 #      conversation_starters:
@@ -569,7 +569,7 @@ endpoints:
 #        allowSelf: true
 #        agent_ids: []
 #      preset:
-#        endpoint: 'LOOP'
+#        endpoint: 'Aeonthic'
 #        model: 'AIKAR-3.2-Pro'
 #        maxContextTokens: 65536 # Maximum context tokens
 #        max_tokens: 4096 # Maximum output tokens

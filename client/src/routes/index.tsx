@@ -7,6 +7,7 @@ import {
   ApiErrorWatcher,
   TwoFactorScreen,
   RequestPasswordReset,
+  Axiom,
 } from '~/components/Auth';
 import { MarketplaceProvider } from '~/components/Agents/MarketplaceContext';
 import AgentMarketplace from '~/components/Agents/Marketplace';
@@ -83,6 +84,10 @@ export const router = createBrowserRouter(
         {
           path: 'register',
           element: <Registration />,
+        },
+        {
+          path: 'axiom',
+          element: <Axiom />,
         },
         {
           path: 'forgot-password',

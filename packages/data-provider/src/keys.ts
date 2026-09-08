@@ -19,6 +19,7 @@ export enum QueryKeys {
   tokenCount = 'tokenCount',
   availablePlugins = 'availablePlugins',
   startupConfig = 'startupConfig',
+  axiomSession = 'axiomSession',
   assistants = 'assistants',
   assistant = 'assistant',
   agents = 'agents',

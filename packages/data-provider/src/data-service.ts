@@ -165,9 +165,15 @@ export const logout = (): Promise<m.TLogoutResponse> => {
   return request.post(endpoints.logout());
 };
 
-export const register = (payload: t.TRegisterUser) => {
-  return request.post(endpoints.register(), payload);
+export const register = (payload: t.TRegisterUser, axiom = false) => {
+  return request.post(axiom ? endpoints.axiomRegister() : endpoints.register(), payload);
 };
+
+export const redeemAxiomKey = (payload: t.TAxiomRedeemRequest): Promise<t.TAxiomSessionResponse> =>
+  request.post(endpoints.axiomRedeem(), payload);
+
+export const getAxiomSession = (): Promise<t.TAxiomSessionResponse> =>
+  request.get(endpoints.axiomSession());
 
 export const userKeyQuery = (name: string): Promise<t.TCheckUserKeyResponse> =>
   request.get(endpoints.userKeyQuery(name));

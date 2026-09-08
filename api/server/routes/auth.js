@@ -1,5 +1,11 @@
 const express = require('express');
-const { createSetBalanceConfig, forceRefreshCloudFrontAuthCookies } = require('@librechat/api');
+const {
+  CLAIM_COOKIE,
+  createSetBalanceConfig,
+  getAxiomCookieOptions,
+  forceRefreshCloudFrontAuthCookies,
+} = require('@librechat/api');
+const { SystemRoles } = require('librechat-data-provider');
 const {
   resetPasswordRequestController,
   resetPasswordController,
@@ -17,6 +23,7 @@ const {
 const { verify2FAWithTempToken } = require('~/server/controllers/auth/TwoFactorAuthController');
 const { logoutController } = require('~/server/controllers/auth/LogoutController');
 const { loginController } = require('~/server/controllers/auth/LoginController');
+const { registerUser } = require('~/server/services/AuthService');
 const { findBalanceByUser, upsertBalanceFields } = require('~/models');
 const { getAppConfig } = require('~/server/services/Config');
 const middleware = require('~/server/middleware');
@@ -28,6 +35,7 @@ const setBalanceConfig = createSetBalanceConfig({
 });
 
 const router = express.Router();
+const { service: axiomService } = require('./axiom');
 const getCloudFrontAuthCookieRefreshResult = (req, res) => {
   const warmedResult = req.cloudFrontAuthCookieRefreshResult;
   if (warmedResult && (warmedResult.attempted || !warmedResult.enabled)) {
@@ -70,6 +78,42 @@ router.post(
   middleware.checkInviteUser,
   middleware.validateRegistration,
   registrationController,
+);
+router.post(
+  '/axiom/register',
+  middleware.registerLimiter,
+  middleware.checkBan,
+  (req, _res, next) => {
+    req.invite = { axiom: true };
+    next();
+  },
+  middleware.validateRegistration,
+  async (req, res) => {
+    const registration = await axiomService.beginRegistration(req.cookies?.[CLAIM_COOKIE]);
+    if (!registration) {
+      return res.status(401).json({ message: 'AXIOM session is invalid or expired' });
+    }
+
+    let completed = false;
+    const response = await registerUser(
+      req.body,
+      { role: SystemRoles.USER },
+      {
+        onCreated: async (user) => {
+          await registration.onCreated(user);
+          completed = true;
+        },
+        onRollback: registration.onRollback,
+      },
+    );
+    if (!completed) {
+      await registration.release();
+    } else {
+      const { maxAge: _maxAge, ...clearOptions } = getAxiomCookieOptions();
+      res.clearCookie(CLAIM_COOKIE, clearOptions);
+    }
+    return res.status(response.status).json({ message: response.message });
+  },
 );
 router.post(
   '/requestPasswordReset',

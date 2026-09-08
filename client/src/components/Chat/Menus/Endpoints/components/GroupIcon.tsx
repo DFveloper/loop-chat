@@ -2,6 +2,7 @@ import React, { memo, useState } from 'react';
 import { AlertCircle } from 'lucide-react';
 import type { IconMapProps } from '~/common';
 import { getKnownEndpointAsset, hasKnownEndpointIcon } from '~/hooks/Endpoint/UnknownIcon';
+import { cn, getThemeAwareBrandLogoClass } from '~/utils';
 import { icons } from '~/hooks/Endpoint/Icons';
 
 interface GroupIconProps {
@@ -65,7 +66,10 @@ const GroupIcon: React.FC<GroupIconProps> = ({ iconURL, groupName }) => {
       <img
         src={resolvedIconURL || iconURL}
         alt={groupName}
-        className="h-full w-full object-cover"
+        className={cn(
+          'h-full w-full object-cover transition-[filter]',
+          getThemeAwareBrandLogoClass(iconURL),
+        )}
         onError={handleImageError}
       />
     </div>

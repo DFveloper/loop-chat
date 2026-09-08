@@ -325,9 +325,10 @@ const verifyEmail = async (req) => {
  * Register a new user.
  * @param {IUser} user <email, password, name, username>
  * @param {Partial<IUser>} [additionalData={}] Trusted server-provided fields, such as CLI overrides.
- * @returns {Promise<{status: number, message: string, user?: IUser}>}
+ * @param {{onCreated?: function(IUser): Promise<void>, onRollback?: function(IUser): Promise<void>}} [lifecycle={}] Trusted AXIOM lifecycle hooks.
+ * @returns {Promise<{status: number, message: string}>}
  */
-const registerUser = async (user, additionalData = {}) => {
+const registerUser = async (user, additionalData = {}, lifecycle = {}) => {
   const result = registerSchema.safeParse(user);
   if (!result.success) {
     const errorMessage = errorsToString(result.error.errors);
@@ -343,7 +344,7 @@ const registerUser = async (user, additionalData = {}) => {
   const { email, password, name, username } = result.data;
   const { provider, ...trustedAdditionalData } = additionalData ?? {};
 
-  let newUserId;
+  let newUser;
   try {
     const tenantId = getTenantId();
     const appConfig = await getAppConfig(tenantId ? { tenantId } : {});
@@ -386,8 +387,8 @@ const registerUser = async (user, additionalData = {}) => {
     const emailEnabled = checkEmailConfig();
     const disableTTL = isEnabled(process.env.ALLOW_UNVERIFIED_EMAIL_LOGIN);
 
-    const newUser = await createUser(newUserData, appConfig.balance, disableTTL, true);
-    newUserId = newUser._id;
+    newUser = await createUser(newUserData, appConfig.balance, disableTTL, true);
+    const newUserId = newUser._id;
     if (emailEnabled && !newUser.emailVerified) {
       await sendVerificationEmail({
         _id: newUserId,
@@ -398,11 +399,14 @@ const registerUser = async (user, additionalData = {}) => {
       await updateUser(newUserId, { emailVerified: true });
     }
 
+    await lifecycle.onCreated?.(newUser);
+
     return { status: 200, message: genericVerificationMessage };
   } catch (err) {
     logger.error('[registerUser] Error in registering user:', err);
-    if (newUserId) {
-      const result = await deleteUserById(newUserId);
+    if (newUser) {
+      await lifecycle.onRollback?.(newUser);
+      const result = await deleteUserById(newUser._id);
       logger.warn(
         `[registerUser] [Email: ${email}] [Temporary User deleted: ${JSON.stringify(result)}]`,
       );

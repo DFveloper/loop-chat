@@ -1,8 +1,8 @@
 import { memo } from 'react';
 import { EModelEndpoint, KnownEndpoints } from 'librechat-data-provider';
 import { CustomMinimalIcon, XAIcon, MoonshotIcon } from '@librechat/client';
+import { cn, getThemeAwareBrandLogoClass } from '~/utils';
 import { IconContext } from '~/common';
-import { cn } from '~/utils';
 
 const knownEndpointAssets: Record<string, string> = {
   [KnownEndpoints.anyscale]: 'assets/anyscale.png',
@@ -99,7 +99,13 @@ function UnknownIcon({
   }
 
   if (iconURL) {
-    return <img className={className} src={iconURL} alt={`${endpoint} Icon`} />;
+    return (
+      <img
+        className={cn(className, 'transition-[filter]', getThemeAwareBrandLogoClass(iconURL))}
+        src={iconURL}
+        alt={`${endpoint} Icon`}
+      />
+    );
   }
 
   const assetPath = getKnownEndpointAsset(currentEndpoint);

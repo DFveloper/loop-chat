@@ -29,6 +29,7 @@ export { default as userSchema } from './user';
 export { default as memorySchema } from './memory';
 export { default as toolFavoriteSchema } from './favorite';
 export { default as groupSchema } from './group';
+export { default as axiomInviteSchema } from './axiomInvite';
 export { default as systemGrantSchema } from './systemGrant';
 export { default as auditLogSchema } from './auditLog';
 export { default as configSchema } from './config';

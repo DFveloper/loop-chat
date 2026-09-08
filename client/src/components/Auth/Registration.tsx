@@ -1,9 +1,9 @@
 import { useForm } from 'react-hook-form';
-import React, { useContext, useState } from 'react';
+import React, { useContext, useEffect, useState } from 'react';
 import { Turnstile } from '@marsidev/react-turnstile';
 import { ThemeContext, SecretInput, Spinner, Button, isDark } from '@librechat/client';
 import { useNavigate, useOutletContext, useLocation } from 'react-router-dom';
-import { useRegisterUserMutation } from 'librechat-data-provider/react-query';
+import { useAxiomSessionQuery, useRegisterUserMutation } from 'librechat-data-provider/react-query';
 import { loginPage } from 'librechat-data-provider';
 import type { TRegisterUser, TError } from 'librechat-data-provider';
 import type { TLoginLayoutContext } from '~/common';
@@ -32,6 +32,8 @@ const Registration: React.FC = () => {
   const location = useLocation();
   const queryParams = new URLSearchParams(location.search);
   const token = queryParams.get('token');
+  const isAxiom = queryParams.get('axiom') === '1';
+  const axiomSession = useAxiomSessionQuery(isAxiom);
   const validTheme = isDark(theme) ? 'dark' : 'light';
 
   // only require captcha if we have a siteKey
@@ -44,32 +46,41 @@ const Registration: React.FC = () => {
   const authSecretButtonClassName =
     'size-9 rounded-xl text-text-secondary-alt hover:bg-transparent hover:text-text-primary';
 
-  const registerUser = useRegisterUserMutation({
-    onMutate: () => {
-      setIsSubmitting(true);
+  useEffect(() => {
+    if (isAxiom && (axiomSession.isError || axiomSession.data?.valid === false)) {
+      navigate('/axiom', { replace: true });
+    }
+  }, [axiomSession.data?.valid, axiomSession.isError, isAxiom, navigate]);
+
+  const registerUser = useRegisterUserMutation(
+    {
+      onMutate: () => {
+        setIsSubmitting(true);
+      },
+      onSuccess: () => {
+        setIsSubmitting(false);
+        setCountdown(3);
+        const timer = setInterval(() => {
+          setCountdown((prevCountdown) => {
+            if (prevCountdown <= 1) {
+              clearInterval(timer);
+              navigate('/c/new', { replace: true });
+              return 0;
+            } else {
+              return prevCountdown - 1;
+            }
+          });
+        }, 1000);
+      },
+      onError: (error: unknown) => {
+        setIsSubmitting(false);
+        if ((error as TError).response?.data?.message) {
+          setErrorMessage((error as TError).response?.data?.message ?? '');
+        }
+      },
     },
-    onSuccess: () => {
-      setIsSubmitting(false);
-      setCountdown(3);
-      const timer = setInterval(() => {
-        setCountdown((prevCountdown) => {
-          if (prevCountdown <= 1) {
-            clearInterval(timer);
-            navigate('/c/new', { replace: true });
-            return 0;
-          } else {
-            return prevCountdown - 1;
-          }
-        });
-      }, 1000);
-    },
-    onError: (error: unknown) => {
-      setIsSubmitting(false);
-      if ((error as TError).response?.data?.message) {
-        setErrorMessage((error as TError).response?.data?.message ?? '');
-      }
-    },
-  });
+    isAxiom,
+  );
 
   const renderInput = (id: string, label: TranslationKeys, type: string, validation: object) => {
     const fieldLabel = localize(label);
@@ -145,7 +156,7 @@ const Registration: React.FC = () => {
             localize('com_auth_email_verification_redirecting', { 0: countdown.toString() })}
         </div>
       )}
-      {!startupConfigError && !isFetching && (
+      {!startupConfigError && !isFetching && (!isAxiom || axiomSession.data?.valid) && (
         <>
           <form
             className="mt-6"

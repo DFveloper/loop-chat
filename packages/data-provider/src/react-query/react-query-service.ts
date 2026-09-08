@@ -242,10 +242,11 @@ export const useUpdateTokenCountMutation = (): UseMutationResult<
 
 export const useRegisterUserMutation = (
   options?: m.RegistrationOptions,
+  axiom = false,
 ): UseMutationResult<t.TError, unknown, t.TRegisterUser, unknown> => {
   const queryClient = useQueryClient();
   return useMutation<t.TRegisterUserResponse, t.TError, t.TRegisterUser>(
-    (payload: t.TRegisterUser) => dataService.register(payload),
+    (payload: t.TRegisterUser) => dataService.register(payload, axiom),
     {
       ...options,
       onSuccess: (...args) => {
@@ -257,6 +258,27 @@ export const useRegisterUserMutation = (
     },
   );
 };
+
+export const useAxiomRedeemMutation = (
+  options?: m.MutationOptions<t.TAxiomSessionResponse, t.TAxiomRedeemRequest>,
+): UseMutationResult<t.TAxiomSessionResponse, t.TError, t.TAxiomRedeemRequest, unknown> =>
+  useMutation<t.TAxiomSessionResponse, t.TError, t.TAxiomRedeemRequest>(
+    (payload) => dataService.redeemAxiomKey(payload),
+    options,
+  );
+
+export const useAxiomSessionQuery = (
+  enabled: boolean,
+): QueryObserverResult<t.TAxiomSessionResponse, t.TError> =>
+  useQuery<t.TAxiomSessionResponse, t.TError>(
+    [QueryKeys.axiomSession],
+    () => dataService.getAxiomSession(),
+    {
+      enabled,
+      retry: false,
+      refetchOnWindowFocus: false,
+    },
+  );
 
 export const useUserKeyQuery = (
   name: string,

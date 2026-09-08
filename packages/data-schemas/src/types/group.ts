@@ -15,6 +15,7 @@ export interface IGroup extends Document {
   createdAt?: Date;
   updatedAt?: Date;
   tenantId?: string;
+  managedBy?: 'axiom';
 }
 
 export interface CreateGroupRequest {

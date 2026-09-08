@@ -95,6 +95,7 @@ const {
   createSession,
   createToken,
   deleteTokens,
+  deleteUserById,
 } = require('~/models');
 const { getAppConfig } = require('~/server/services/Config');
 const { sendEmail } = require('~/server/utils');
@@ -470,6 +471,33 @@ describe('registerUser', () => {
         provider: 'google',
       }),
     );
+  });
+
+  it('runs the trusted lifecycle hook after creating a forced USER account', async () => {
+    const onCreated = jest.fn();
+    const result = await registerUser(registrationPayload, { role: 'USER' }, { onCreated });
+
+    expect(result.status).toBe(200);
+    expect(createUser.mock.calls[0][0].role).toBe('USER');
+    expect(onCreated).toHaveBeenCalledWith({ _id: 'new-user-id' });
+  });
+
+  it('rolls back the account when the trusted post-create hook fails', async () => {
+    const onRollback = jest.fn();
+    const result = await registerUser(
+      registrationPayload,
+      { role: 'USER' },
+      {
+        onCreated: async () => {
+          throw new Error('group failed');
+        },
+        onRollback,
+      },
+    );
+
+    expect(result.status).toBe(500);
+    expect(onRollback).toHaveBeenCalledWith({ _id: 'new-user-id' });
+    expect(deleteUserById).toHaveBeenCalledWith('new-user-id');
   });
 });
 

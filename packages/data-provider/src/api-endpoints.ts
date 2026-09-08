@@ -169,6 +169,9 @@ export const login = () => `${BASE_URL}/api/auth/login`;
 export const logout = () => `${BASE_URL}/api/auth/logout`;
 
 export const register = () => `${BASE_URL}/api/auth/register`;
+export const axiomRegister = () => `${BASE_URL}/api/auth/axiom/register`;
+export const axiomRedeem = () => `${BASE_URL}/api/axiom/redeem`;
+export const axiomSession = () => `${BASE_URL}/api/axiom/session`;
 
 export const loginFacebook = () => `${BASE_URL}/api/auth/facebook`;
 

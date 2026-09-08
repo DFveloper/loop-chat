@@ -32,6 +32,7 @@ export * from './skillSync';
 /* Access Control */
 export * from './accessRole';
 export * from './aclEntry';
+export * from './axiomInvite';
 export * from './systemGrant';
 export * from './auditLog';
 export * from './group';

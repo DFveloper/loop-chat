@@ -428,6 +428,7 @@ if (cluster.isMaster) {
     /** Routes */
     app.use('/oauth', routes.oauth);
     app.use('/api/auth', routes.auth);
+    app.use('/api/axiom', routes.axiom);
     app.use('/api/admin', routes.adminAuth);
     app.use('/api/admin/skills', routes.adminSkills);
     app.use('/api/actions', routes.actions);
