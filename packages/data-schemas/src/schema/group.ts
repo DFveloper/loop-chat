@@ -60,10 +60,13 @@ groupSchema.index(
     partialFilterExpression: { idOnTheSource: { $exists: true } },
   },
 );
-groupSchema.index({ memberIds: 1 });
+groupSchema.index({ memberIds: 1, tenantId: 1 });
 groupSchema.index(
   { managedBy: 1, tenantId: 1 },
-  { unique: true, partialFilterExpression: { managedBy: 'axiom' } },
+  {
+    unique: true,
+    partialFilterExpression: { managedBy: 'axiom' },
+  },
 );
 
 export default groupSchema;

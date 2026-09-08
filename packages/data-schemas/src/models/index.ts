@@ -1,12 +1,21 @@
+import { createAgentQueuedTurnModel, createAgentQueuedTurnSequenceModel } from './queuedTurn';
+import { createAgentTriggerLaneSequenceModel } from './triggerLaneSequence';
+import { createScheduleModel, createScheduleRunModel } from './schedule';
 import { createSkillSyncCredentialModel } from './skillSyncCredential';
+import { createOpenIDRefreshFlightModel } from './openidRefreshFlight';
+import { createAgentTriggerUserPurgeModel } from './triggerUserPurge';
+import { createRefreshTokenBridgeModel } from './refreshTokenBridge';
+import { createAgentTriggerDeliveryModel } from './triggerDelivery';
 import { createSkillSyncStatusModel } from './skillSyncStatus';
 import { createConversationTagModel } from './conversationTag';
+import { createCodeEnvironmentModel } from './codeEnvironment';
 import { createAgentCategoryModel } from './agentCategory';
 import { createChatProjectModel } from './chatProject';
 import { createAgentApiKeyModel } from './agentApiKey';
 import { createTransactionModel } from './transaction';
 import { createPromptGroupModel } from './promptGroup';
 import { createSystemGrantModel } from './systemGrant';
+import { createAxiomInviteModel } from './axiomInvite';
 import { createPluginAuthModel } from './pluginAuth';
 import { createSharedLinkModel } from './sharedLink';
 import { createAccessRoleModel } from './accessRole';
@@ -31,11 +40,11 @@ import { createTokenModel } from './token';
 import { createAgentModel } from './agent';
 import { createSkillModel } from './skill';
 import { createGroupModel } from './group';
-import { createAxiomInviteModel } from './axiomInvite';
 import { createUserModel } from './user';
 import { createRoleModel } from './role';
 import { createFileModel } from './file';
 import { createKeyModel } from './key';
+import logger from '~/config/winston';
 
 /**
  * Creates all database models for all collections
@@ -47,6 +56,7 @@ export function createModels(mongoose: typeof import('mongoose')): {
   Balance: ReturnType<typeof createBalanceModel>;
   Conversation: ReturnType<typeof createConversationModel>;
   ChatProject: ReturnType<typeof createChatProjectModel>;
+  CodeEnvironment: ReturnType<typeof createCodeEnvironmentModel>;
   Message: ReturnType<typeof createMessageModel>;
   Agent: ReturnType<typeof createAgentModel>;
   AgentApiKey: ReturnType<typeof createAgentApiKeyModel>;
@@ -78,15 +88,25 @@ export function createModels(mongoose: typeof import('mongoose')): {
   AuditLog: ReturnType<typeof createAuditLogModel>;
   Group: ReturnType<typeof createGroupModel>;
   Config: ReturnType<typeof createConfigModel>;
+  AgentTriggerDelivery: ReturnType<typeof createAgentTriggerDeliveryModel>;
+  AgentTriggerLaneSequence: ReturnType<typeof createAgentTriggerLaneSequenceModel>;
+  AgentTriggerUserPurge: ReturnType<typeof createAgentTriggerUserPurgeModel>;
+  AgentQueuedTurn: ReturnType<typeof createAgentQueuedTurnModel>;
+  AgentQueuedTurnSequence: ReturnType<typeof createAgentQueuedTurnSequenceModel>;
+  Schedule: ReturnType<typeof createScheduleModel>;
+  ScheduleRun: ReturnType<typeof createScheduleRunModel>;
+  RefreshTokenBridge: ReturnType<typeof createRefreshTokenBridgeModel>;
+  OpenIDRefreshFlight: ReturnType<typeof createOpenIDRefreshFlightModel>;
   AxiomInvite: ReturnType<typeof createAxiomInviteModel>;
 } {
-  return {
+  const models = {
     User: createUserModel(mongoose),
     Token: createTokenModel(mongoose),
     Session: createSessionModel(mongoose),
     Balance: createBalanceModel(mongoose),
     Conversation: createConversationModel(mongoose),
     ChatProject: createChatProjectModel(mongoose),
+    CodeEnvironment: createCodeEnvironmentModel(mongoose),
     Message: createMessageModel(mongoose),
     Agent: createAgentModel(mongoose),
     AgentApiKey: createAgentApiKeyModel(mongoose),
@@ -118,6 +138,30 @@ export function createModels(mongoose: typeof import('mongoose')): {
     AuditLog: createAuditLogModel(mongoose),
     Group: createGroupModel(mongoose),
     Config: createConfigModel(mongoose),
+    AgentTriggerDelivery: createAgentTriggerDeliveryModel(mongoose),
+    AgentTriggerLaneSequence: createAgentTriggerLaneSequenceModel(mongoose),
+    AgentTriggerUserPurge: createAgentTriggerUserPurgeModel(mongoose),
+    AgentQueuedTurn: createAgentQueuedTurnModel(mongoose),
+    AgentQueuedTurnSequence: createAgentQueuedTurnSequenceModel(mongoose),
+    Schedule: createScheduleModel(mongoose),
+    ScheduleRun: createScheduleRunModel(mongoose),
+    RefreshTokenBridge: createRefreshTokenBridgeModel(mongoose),
+    OpenIDRefreshFlight: createOpenIDRefreshFlightModel(mongoose),
     AxiomInvite: createAxiomInviteModel(mongoose),
   };
+  /**
+   * Background index builds fail silently unless an 'index' listener is
+   * attached (e.g. Amazon DocumentDB <5.0 rejecting partialFilterExpression),
+   * leaving unique constraints unenforced with no trace in the logs.
+   */
+  for (const model of Object.values(models)) {
+    if (model.listenerCount('index') === 0) {
+      model.on('index', (error?: Error) => {
+        if (error) {
+          logger.error(`Index build failed for "${model.modelName}": ${error.message}`);
+        }
+      });
+    }
+  }
+  return models;
 }

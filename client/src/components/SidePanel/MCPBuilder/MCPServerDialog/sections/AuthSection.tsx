@@ -1,8 +1,16 @@
 import { useMemo, useState } from 'react';
-import { Copy, CopyCheck } from 'lucide-react';
+import { Copy, CopyCheck } from 'lucide';
 import { useFormContext, useWatch } from 'react-hook-form';
-import { Permissions, PermissionTypes } from 'librechat-data-provider';
-import { Label, Input, Checkbox, SecretInput, Radio, useToastContext } from '@librechat/client';
+import { Permissions, PermissionTypes, TokenExchangeMethodEnum } from 'librechat-data-provider';
+import {
+  Label,
+  Input,
+  Radio,
+  Checkbox,
+  MorphIcon,
+  SecretInput,
+  useToastContext,
+} from '@librechat/client';
 import type { MCPServerFormData } from '../hooks/useMCPServerForm';
 import { AuthTypeEnum, AuthorizationTypeEnum } from '../hooks/useMCPServerForm';
 import { useLocalize, useCopyToClipboard, useHasAccess } from '~/hooks';
@@ -13,6 +21,8 @@ interface AuthSectionProps {
   isEditMode: boolean;
   serverName?: string;
 }
+
+const AUTO_TOKEN_EXCHANGE_METHOD = 'auto';
 
 export default function AuthSection({ isEditMode, serverName }: AuthSectionProps) {
   const localize = useLocalize();
@@ -41,6 +51,10 @@ export default function AuthSection({ isEditMode, serverName }: AuthSectionProps
   const authorizationType = useWatch<MCPServerFormData, 'auth.api_key_authorization_type'>({
     name: 'auth.api_key_authorization_type',
   }) as AuthorizationTypeEnum;
+
+  const tokenExchangeMethod = useWatch<MCPServerFormData, 'auth.oauth_token_exchange_method'>({
+    name: 'auth.oauth_token_exchange_method',
+  });
 
   const redirectUri = serverName
     ? `${window.location.origin}/api/mcp/${serverName}/oauth/callback`
@@ -265,6 +279,40 @@ export default function AuthSection({ isEditMode, serverName }: AuthSectionProps
             <Input id="oauth_scope" placeholder="read write" {...register('auth.oauth_scope')} />
           </div>
 
+          {/* Token exchange method */}
+          <fieldset className="space-y-1.5">
+            <legend>
+              <Label id="oauth-token-exchange-method-label" className="text-sm font-medium">
+                {localize('com_ui_token_exchange_method')}
+              </Label>
+            </legend>
+            <Radio
+              options={[
+                { value: AUTO_TOKEN_EXCHANGE_METHOD, label: localize('com_ui_auto') },
+                {
+                  value: TokenExchangeMethodEnum.DefaultPost,
+                  label: localize('com_ui_default_post_request'),
+                },
+                {
+                  value: TokenExchangeMethodEnum.BasicAuthHeader,
+                  label: localize('com_ui_basic_auth_header'),
+                },
+              ]}
+              value={tokenExchangeMethod ?? AUTO_TOKEN_EXCHANGE_METHOD}
+              onChange={(value) =>
+                setValue(
+                  'auth.oauth_token_exchange_method',
+                  value === AUTO_TOKEN_EXCHANGE_METHOD
+                    ? undefined
+                    : (value as TokenExchangeMethodEnum),
+                  { shouldDirty: true },
+                )
+              }
+              fullWidth
+              aria-labelledby="oauth-token-exchange-method-label"
+            />
+          </fieldset>
+
           {/* Redirect URI */}
           {isEditMode && redirectUri && (
             <div className="space-y-1.5">
@@ -283,13 +331,13 @@ export default function AuthSection({ isEditMode, serverName }: AuthSectionProps
                   type="button"
                   onClick={() => {
                     if (isCopying) return;
+                    if (!copyLink(setIsCopying)) return;
                     showToast({ message: localize('com_ui_copied_to_clipboard') });
-                    copyLink(setIsCopying);
                   }}
                   className="flex size-10 shrink-0 items-center justify-center rounded-lg border border-border-light text-text-secondary transition-colors hover:bg-surface-hover hover:text-text-primary"
                   aria-label={localize('com_ui_copy_link')}
                 >
-                  {isCopying ? <CopyCheck className="size-4" /> : <Copy className="size-4" />}
+                  <MorphIcon icon={isCopying ? CopyCheck : Copy} className="size-4" />
                 </button>
               </div>
             </div>

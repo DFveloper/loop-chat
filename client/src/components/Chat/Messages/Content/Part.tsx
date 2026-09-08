@@ -14,21 +14,24 @@ import {
   AgentUpdate,
   EmptyText,
   Reasoning,
+  ReasoningMarker,
   Summary,
   Text,
   SkillCall,
+  MemoryCall,
   ReadFileCall,
   FileAuthoringCall,
   BashCall,
   SubagentCall,
+  SteerPart,
 } from './Parts';
+import { getCachedPreview, getActivityLabelPart, getActivityLabelText } from '~/utils';
 import { getAskUserQuestionPart } from '~/utils/approval';
 import AskUserQuestionCall from './AskUserQuestionCall';
 import { isBashProgrammaticToolCall } from './routing';
 import { ErrorMessage } from './MessageContent';
 import AskUserQuestion from './AskUserQuestion';
 import RetrievalCall from './RetrievalCall';
-import { getCachedPreview } from '~/utils';
 import ToolApproval from './ToolApproval';
 import AgentHandoff from './AgentHandoff';
 import CodeAnalyze from './CodeAnalyze';
@@ -66,8 +69,23 @@ const Part = memo(function Part({
   if (askUserQuestion) {
     return (
       <AskUserQuestion
+        key={askUserQuestion.ask_user_question.actionId}
         actionId={askUserQuestion.ask_user_question.actionId}
         question={askUserQuestion.ask_user_question.question}
+        questions={askUserQuestion.ask_user_question.questions}
+      />
+    );
+  }
+
+  if (part.type === ContentTypes.STEER) {
+    return (
+      <SteerPart
+        steer={part[ContentTypes.STEER]}
+        files={part.files}
+        quotes={part.quotes}
+        steerId={part.steerId}
+        createdAt={part.createdAt}
+        isSubmitting={isSubmitting}
       />
     );
   }
@@ -130,7 +148,16 @@ const Part = memo(function Part({
     if (typeof reasoning !== 'string') {
       return null;
     }
-    return <Reasoning reasoning={reasoning} isLast={isLast ?? false} />;
+    if (reasoning.trim() === '' && part.reasoning_unavailable === true) {
+      return <ReasoningMarker label={part.reasoning_label} />;
+    }
+    return (
+      <Reasoning
+        reasoning={reasoning}
+        isLast={isLast ?? false}
+        reasoningLabel={part.reasoning_label}
+      />
+    );
   } else if (part.type === ContentTypes.SUMMARY) {
     return (
       <Summary
@@ -138,8 +165,26 @@ const Part = memo(function Part({
         model={part.model}
         provider={part.provider}
         tokenCount={part.tokenCount}
+        initiatedBy={part.initiatedBy}
         summarizing={part.summarizing}
+        failed={part.failed}
       />
+    );
+  } else if (part.type === ContentTypes.ACTIVITY_LABEL) {
+    /** Orphan label (its block's parts were filtered/hidden): renders as a
+     *  standalone line. Labeled blocks normally render via ToolCallGroup,
+     *  which consumes the label part as the group header instead. */
+    const display = getActivityLabelText(getActivityLabelPart(part));
+    if (!display) {
+      return null;
+    }
+    const failed = part.status === 'failed' || part.status === 'partial';
+    return (
+      <div
+        className={`my-1 break-words pl-1 text-sm italic ${failed ? 'text-text-warning' : 'text-text-secondary'}`}
+      >
+        {display}
+      </div>
     );
   } else if (part.type === ContentTypes.TOOL_CALL) {
     const toolCall = part[ContentTypes.TOOL_CALL];
@@ -151,6 +196,8 @@ const Part = memo(function Part({
     const isToolCall =
       'args' in toolCall && (!toolCall.type || toolCall.type === ToolCallTypes.TOOL_CALL);
     if (isToolCall) {
+      const toolCallId =
+        'id' in toolCall && typeof toolCall.id === 'string' ? toolCall.id : undefined;
       const card = (() => {
         if (isBashProgrammaticToolCall(toolCall.name, toolCall.args)) {
           return (
@@ -159,10 +206,14 @@ const Part = memo(function Part({
               output={toolCall.output ?? ''}
               initialProgress={toolCall.progress ?? 0.1}
               isSubmitting={isSubmitting}
+              runStepStatus={toolCall.runStepStatus}
+              runStepDurationMs={toolCall.runStepDurationMs}
+              backgrounded={toolCall.backgrounded}
               attachments={attachments}
               commandField="code"
               hideAttachments={hideAttachments}
               onExpand={onToolExpand}
+              toolCallId={toolCallId}
             />
           );
         } else if (
@@ -174,11 +225,15 @@ const Part = memo(function Part({
             <ExecuteCode
               attachments={attachments}
               isSubmitting={isSubmitting}
+              runStepStatus={toolCall.runStepStatus}
+              runStepDurationMs={toolCall.runStepDurationMs}
+              backgrounded={toolCall.backgrounded}
               output={toolCall.output ?? ''}
               initialProgress={toolCall.progress ?? 0.1}
               args={toolCall.args}
               hideAttachments={hideAttachments}
               onExpand={onToolExpand}
+              toolCallId={toolCallId}
             />
           );
         } else if (
@@ -190,8 +245,9 @@ const Part = memo(function Part({
             <ImageGen
               initialProgress={toolCall.progress ?? 0.1}
               isSubmitting={isSubmitting}
+              runStepStatus={toolCall.runStepStatus}
               toolName={toolCall.name}
-              args={typeof toolCall.args === 'string' ? toolCall.args : ''}
+              args={toolCall.args ?? ''}
               output={toolCall.output ?? ''}
               attachments={attachments}
               hideAttachments={hideAttachments}
@@ -206,6 +262,10 @@ const Part = memo(function Part({
               output={typeof toolCall.output === 'string' ? toolCall.output : ''}
               toolCallId={toolCall.id}
               isSubmitting={isSubmitting}
+              runStepStatus={toolCall.runStepStatus}
+              showCursor={showCursor}
+              failed={'inputValidationError' in toolCall && toolCall.inputValidationError === true}
+              onExpand={onToolExpand}
             />
           );
         } else if (toolCall.name === 'skill') {
@@ -215,6 +275,8 @@ const Part = memo(function Part({
               output={toolCall.output ?? ''}
               initialProgress={toolCall.progress ?? 0.1}
               isSubmitting={isSubmitting}
+              runStepStatus={toolCall.runStepStatus}
+              runStepDurationMs={toolCall.runStepDurationMs}
               attachments={attachments}
               hideAttachments={hideAttachments}
               onExpand={onToolExpand}
@@ -239,9 +301,25 @@ const Part = memo(function Part({
               output={toolCall.output ?? ''}
               initialProgress={toolCall.progress ?? 0.1}
               isSubmitting={isSubmitting}
+              runStepStatus={toolCall.runStepStatus}
               attachments={attachments}
               persistedContent={persistedContent}
               hideAttachments={hideAttachments}
+            />
+          );
+        } else if (toolCall.name === 'set_memory' || toolCall.name === 'delete_memory') {
+          return (
+            <MemoryCall
+              toolName={toolCall.name}
+              args={toolCall.args}
+              output={toolCall.output ?? ''}
+              initialProgress={toolCall.progress ?? 0.1}
+              isSubmitting={isSubmitting}
+              runStepStatus={toolCall.runStepStatus}
+              runStepDurationMs={toolCall.runStepDurationMs}
+              attachments={attachments}
+              hideAttachments={hideAttachments}
+              onExpand={onToolExpand}
             />
           );
         } else if (toolCall.name === 'read_file') {
@@ -251,6 +329,8 @@ const Part = memo(function Part({
               output={toolCall.output ?? ''}
               initialProgress={toolCall.progress ?? 0.1}
               isSubmitting={isSubmitting}
+              runStepStatus={toolCall.runStepStatus}
+              runStepDurationMs={toolCall.runStepDurationMs}
               attachments={attachments}
               hideAttachments={hideAttachments}
               onExpand={onToolExpand}
@@ -264,6 +344,8 @@ const Part = memo(function Part({
               output={toolCall.output ?? ''}
               initialProgress={toolCall.progress ?? 0.1}
               isSubmitting={isSubmitting}
+              runStepStatus={toolCall.runStepStatus}
+              runStepDurationMs={toolCall.runStepDurationMs}
               attachments={attachments}
               hideAttachments={hideAttachments}
               onExpand={onToolExpand}
@@ -276,18 +358,25 @@ const Part = memo(function Part({
               output={toolCall.output ?? ''}
               initialProgress={toolCall.progress ?? 0.1}
               isSubmitting={isSubmitting}
+              runStepStatus={toolCall.runStepStatus}
+              runStepDurationMs={toolCall.runStepDurationMs}
+              backgrounded={toolCall.backgrounded}
               attachments={attachments}
               hideAttachments={hideAttachments}
               onExpand={onToolExpand}
+              toolCallId={toolCallId}
             />
           );
         } else if (toolCall.name === Tools.web_search) {
           return (
             <WebSearch
+              args={toolCall.args}
               output={toolCall.output ?? ''}
               initialProgress={toolCall.progress ?? 0.1}
               isSubmitting={isSubmitting}
+              runStepStatus={toolCall.runStepStatus}
               attachments={attachments}
+              hideAttachments={hideAttachments}
               isLast={isLast}
               onExpand={onToolExpand}
             />
@@ -297,6 +386,9 @@ const Part = memo(function Part({
             <RetrievalCall
               initialProgress={toolCall.progress ?? 0.1}
               isSubmitting={isSubmitting}
+              runStepStatus={toolCall.runStepStatus}
+              runStepDurationMs={toolCall.runStepDurationMs}
+              args={toolCall.args}
               output={toolCall.output ?? undefined}
               attachments={attachments}
               onExpand={onToolExpand}
@@ -309,6 +401,7 @@ const Part = memo(function Part({
           <ToolCall
             args={toolCall.args ?? ''}
             name={toolCall.name || ''}
+            toolCallId={toolCallId}
             output={toolCall.output ?? ''}
             initialProgress={toolCall.progress ?? 0.1}
             isSubmitting={isSubmitting}
@@ -317,6 +410,8 @@ const Part = memo(function Part({
             isLast={isLast}
             hideAttachments={hideAttachments}
             onExpand={onToolExpand}
+            runStepStatus={toolCall.runStepStatus}
+            runStepDurationMs={toolCall.runStepDurationMs}
           />
         );
       })();
@@ -356,6 +451,8 @@ const Part = memo(function Part({
         <RetrievalCall
           initialProgress={toolCall.progress ?? 0.1}
           isSubmitting={isSubmitting}
+          runStepStatus={toolCall.runStepStatus}
+          runStepDurationMs={toolCall.runStepDurationMs}
           output={(toolCall as { output?: string }).output}
           attachments={attachments}
           onExpand={onToolExpand}
@@ -371,6 +468,7 @@ const Part = memo(function Part({
           initialProgress={toolCall.progress ?? 0.1}
           args={toolCall.function.arguments as string}
           isSubmitting={isSubmitting}
+          runStepStatus={toolCall.runStepStatus}
           toolName={toolCall.function.name}
           output={toolCall.function.output ?? ''}
         />

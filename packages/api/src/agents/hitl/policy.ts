@@ -1,6 +1,8 @@
 import { randomUUID, createHash } from 'crypto';
+import { openAIBaseSchema, googleBaseSchema, anthropicBaseSchema } from 'librechat-data-provider';
 import type { Agents, TToolApprovalPolicy } from 'librechat-data-provider';
 import type { ToolPolicyConfig } from '@librechat/agents';
+import type { MCPToolAlias } from '~/tools/classification';
 
 /**
  * Default decisions offered to the user for a paused tool call.
@@ -14,10 +16,9 @@ const DEFAULT_REVIEW_DECISIONS: Agents.ToolApprovalDecisionType[] = ['approve', 
 /**
  * Layered sources that combine into the effective tool-approval policy for a turn.
  *
- * Only {@link ToolApprovalPolicyLayers.endpoint} is consumed today; `agent` and
- * `skills` are reserved seams so future per-agent / per-skill plumbing lands in
- * {@link resolveToolApprovalPolicy} rather than being threaded through the run
- * call site.
+ * Endpoint policy remains the administrative baseline. Attached code environments
+ * also activate LibreChat's built-in BYOM baseline; `agent` and `skills` remain
+ * reserved seams for future persisted overrides.
  */
 export interface ToolApprovalPolicyLayers {
   /**
@@ -37,6 +38,12 @@ export interface ToolApprovalPolicyLayers {
    * skill can never silently auto-approve a tool.
    */
   skills?: TToolApprovalPolicy[];
+  /**
+   * At least one agent in this run executes in an attached, user-operated environment.
+   * Attached environments get LibreChat's safe approval baseline without requiring
+   * an administrator to opt the whole endpoint into prompts.
+   */
+  attachedCodeEnvironment?: boolean;
 }
 
 /**
@@ -49,13 +56,26 @@ export interface ToolApprovalPolicyLayers {
  *   - `agent` overrides `mode`/`allow`/`deny`/`ask`/`reason`;
  *   - `skills` may only tighten (add `ask`/`deny`), never loosen.
  *
- * Today only `endpoint` is consumed, so the result is identical to reading
- * `endpoints.agents.toolApproval` directly — `agent`/`skills` are accepted but
- * not yet merged. Behaviour-preserving until those layers ship.
+ * When no endpoint policy is active, BYOM adds `enabled: true, mode: 'bypass'` and
+ * an agent-scoped hook supplies its coding decisions. An already-enabled endpoint
+ * policy remains the run-wide administrative baseline, including its unmatched-tool
+ * mode. An explicit endpoint `enabled: false` remains the administrator emergency
+ * override. `agent`/`skills` are accepted but not yet merged.
  */
 export function resolveToolApprovalPolicy(
   layers: ToolApprovalPolicyLayers,
 ): TToolApprovalPolicy | undefined {
+  if (
+    layers.attachedCodeEnvironment === true &&
+    layers.endpoint?.enabled !== true &&
+    layers.endpoint?.enabled !== false
+  ) {
+    return {
+      ...layers.endpoint,
+      enabled: true,
+      mode: 'bypass',
+    };
+  }
   return layers.endpoint;
 }
 
@@ -74,8 +94,61 @@ export function resolveToolApprovalPolicy(
  * any multi-process deployment. Pair this predicate with the checkpointer
  * assignment at the `Run.create` call site.
  */
-export function isHITLEnabled(policy: TToolApprovalPolicy | undefined): boolean {
+export function isHITLEnabled(
+  policy: TToolApprovalPolicy | undefined,
+): policy is NonNullable<TToolApprovalPolicy> {
   return policy?.enabled === true;
+}
+
+/**
+ * Whether the configured policy can structurally return `ask` for any tool.
+ *
+ * `bypass` and `dontAsk` are non-pausing fallbacks; only an explicit ask rule
+ * or a programmatic hook can tighten them to `ask`. A catch-all deny remains
+ * non-pausing because deny wins over every hook/rule, while a catch-all allow
+ * removes the default mode's unmatched-tool ask fallback. More-specific pattern
+ * overlap is intentionally treated conservatively because the run's complete
+ * lazy tool surface is not known at admission time.
+ */
+export function isToolApprovalPauseCapable(
+  policy: TToolApprovalPolicy | undefined,
+  hasProgrammaticHooks = false,
+  toolNames?: readonly string[],
+): boolean {
+  if (!isHITLEnabled(policy)) {
+    return false;
+  }
+  const enabledPolicy = policy;
+  if (toolNames != null) {
+    const names = Array.from(new Set(toolNames.filter((name) => name.length > 0)));
+    if (names.length === 0) {
+      return false;
+    }
+    const matches = (patterns: string[] | undefined, name: string): boolean =>
+      patterns?.some((pattern) => globToRegex(pattern).test(name)) === true;
+    return names.some((name) => {
+      if (matches(enabledPolicy.deny, name)) {
+        return false;
+      }
+      if (hasProgrammaticHooks || matches(enabledPolicy.ask, name)) {
+        return true;
+      }
+      if (matches(enabledPolicy.allow, name)) {
+        return false;
+      }
+      return enabledPolicy.mode !== 'bypass' && enabledPolicy.mode !== 'dontAsk';
+    });
+  }
+  if (policy?.deny?.includes('*')) {
+    return false;
+  }
+  if (hasProgrammaticHooks || (policy?.ask?.length ?? 0) > 0) {
+    return true;
+  }
+  if (policy?.mode === 'bypass' || policy?.mode === 'dontAsk') {
+    return false;
+  }
+  return policy?.allow?.includes('*') !== true;
 }
 
 /**
@@ -85,6 +158,104 @@ export function isHITLEnabled(policy: TToolApprovalPolicy | undefined): boolean 
  * defaults apply). The `enabled` field is LibreChat-only and stripped here —
  * it's consumed separately via {@link isHITLEnabled} to gate the SDK opt-out.
  */
+/** Anchored-glob matcher mirroring the SDK's `createToolPolicyHook` semantics exactly. */
+function globToRegex(pattern: string): RegExp {
+  const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp('^' + escaped.replace(/\*/g, '.*') + '$');
+}
+
+/** Whether an enabled static policy unconditionally denies one concrete tool name. */
+export function isToolDeniedByApprovalPolicy(
+  policy: TToolApprovalPolicy | undefined,
+  toolName: string,
+): boolean {
+  return (
+    isHITLEnabled(policy) &&
+    policy.deny?.some((pattern) => globToRegex(pattern).test(toolName)) === true
+  );
+}
+
+/**
+ * Extends each `toolApproval` pattern list with the names of tools whose
+ * OTHER spelling matches, so admin YAML keeps applying when a tool's key
+ * spelling changed in either direction: patterns written against pre-strip
+ * upstream naming reach the stripped instances (a non-matching `deny` would
+ * otherwise FAIL OPEN), and patterns written against the current catalog
+ * naming reach legacy-named instances retained by unedited agents. Healing
+ * is list-level (literal names appended, patterns never rewritten), so
+ * `deny`/`ask`/`allow` precedence semantics are unchanged, and a name
+ * already matched by its own list is skipped.
+ */
+export function healToolApprovalPolicy(
+  policy: TToolApprovalPolicy | undefined,
+  aliases: readonly MCPToolAlias[],
+): TToolApprovalPolicy | undefined {
+  if (!policy || aliases.length === 0) {
+    return policy;
+  }
+  const healList = (patterns: string[] | undefined): string[] | undefined => {
+    if (!patterns || patterns.length === 0) {
+      return patterns;
+    }
+    const regexes = patterns.map(globToRegex);
+    const appended: string[] = [];
+    for (const { name, aliasName } of aliases) {
+      if (name === aliasName || regexes.some((regex) => regex.test(name))) {
+        continue;
+      }
+      if (regexes.some((regex) => regex.test(aliasName))) {
+        appended.push(name);
+      }
+    }
+    return appended.length > 0 ? [...patterns, ...appended] : patterns;
+  };
+  return {
+    ...policy,
+    allow: healList(policy.allow),
+    deny: healList(policy.deny),
+    ask: healList(policy.ask),
+  };
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Names whose OTHER spelling matches a programmatic hook's regex matcher
+ * while their own name does not — the hook must also fire for these or its
+ * argument-, user-, or tenant-specific deny/ask decisions are silently
+ * skipped for renamed tools. Mirrors the SDK's unanchored `new RegExp(pattern)`
+ * matcher semantics; an invalid pattern matches nothing there, so it aliases
+ * nothing here.
+ */
+export function collectAliasMatcherNames(
+  matcher: string | undefined,
+  aliases: readonly MCPToolAlias[],
+): string[] {
+  if (!matcher || aliases.length === 0) {
+    return [];
+  }
+  let regex: RegExp;
+  try {
+    regex = new RegExp(matcher);
+  } catch {
+    return [];
+  }
+  const names: string[] = [];
+  for (const { name, aliasName } of aliases) {
+    if (name !== aliasName && !regex.test(name) && regex.test(aliasName)) {
+      names.push(name);
+    }
+  }
+  return names;
+}
+
+/** Anchored exact-name pattern for the alias-matched names of one hook matcher. */
+export function buildAliasMatcherPattern(names: readonly string[]): string {
+  return `^(?:${names.map(escapeRegExp).join('|')})$`;
+}
+
 export function mapToolApprovalPolicy(
   policy: TToolApprovalPolicy | undefined,
 ): ToolPolicyConfig | undefined {
@@ -163,6 +334,8 @@ export interface PendingActionContext {
   responseMessageId?: string;
   /** Optional TTL (ms). When set, `expiresAt = createdAt + ttlMs`. */
   ttlMs?: number;
+  /** Optional absolute upper bound inherited from an enclosing event binding. */
+  expiresAt?: Date | string | number;
   /** Override actionId; defaults to a fresh uuid. */
   actionId?: string;
   /** SDK interrupt id (`RunInterruptResult.interruptId`) for cross-process resume. */
@@ -173,6 +346,8 @@ export interface PendingActionContext {
   requestFingerprint?: string;
   /** Graph-determining fields to replay on resume; see {@link RESUME_CONTEXT_KEYS}. */
   resumeContext?: Record<string, unknown>;
+  /** Opaque server-only binding to the stateful code targets selected at pause time. */
+  codeExecutionBinding?: Agents.CodeExecutionApprovalBinding;
 }
 
 /** Request fields that decide which agent/graph + tool set a turn runs. */
@@ -185,6 +360,7 @@ export interface AgentRequestFingerprintFields {
   /** Ephemeral agents derive their system instructions from this; pin it too. */
   promptPrefix?: string | null;
   ephemeralAgent?: Record<string, unknown> | null;
+  codeApprovalMode?: string | null;
 }
 
 /** Stable, order-independent serialization of the ephemeral capability config. */
@@ -222,6 +398,7 @@ export const RESUME_CONTEXT_KEYS = [
   'model',
   'promptPrefix',
   'ephemeralAgent',
+  'codeApprovalMode',
   // The agents build reads addedConvo into endpointOption to add parallel/secondary
   // agents; the resume POST can't reconstruct it, so replay it from the paused request.
   'addedConvo',
@@ -236,6 +413,16 @@ export const RESUME_CONTEXT_KEYS = [
   // different skill's tools (manualSkills isn't covered by the fingerprint). Replay-only.
   // (alwaysAppliedSkills is NOT here — it's resolved server-side from the DB, not req.body.)
   'manualSkills',
+  // Graph-determining for ephemeral agents: `loadEphemeralAgent` encodes the agent id
+  // (and thus the LangGraph node name / HITL checkpoint namespace) from
+  // `sender = modelLabel ?? modelSpec.label ?? …`. `modelLabel` is stripped from the
+  // RESOLVED llmConfig captured at pause (sanitizeResumeModelParameters reads the
+  // initialized agent's model_parameters), so without replaying the original request
+  // value the resumed id falls back to modelSpec.label → a DIFFERENT id → the interrupt
+  // checkpoint (namespaced by the paused id) can't be re-entered → empty-graph resume
+  // (#14253). It rides top-level on req.body and flows into model_parameters via the
+  // build spread, so replaying it here restores the stable id. Replay-only.
+  'modelLabel',
 ] as const;
 
 export type ResumeContext = Partial<Record<(typeof RESUME_CONTEXT_KEYS)[number], unknown>> & {
@@ -267,6 +454,7 @@ const SENSITIVE_PARAM_KEYS = new Set([
   'httpagent',
   'httpsagent',
   'callbacks',
+  'endpoint',
   'endpointhost',
   'endpoint_host',
 ]);
@@ -329,13 +517,68 @@ function sanitizeParamValue(value: unknown, depth: number): unknown {
 }
 
 /**
+ * The resolved Anthropic `thinking` parameter is a provider-format object
+ * (`{ type: 'enabled' | 'disabled' | 'adaptive', budget_tokens? }`) for Opus/Sonnet
+ * 4+, but the request body — and the compact-convo schema (`thinking: z.boolean()`)
+ * that the resume replay is validated against — expects the UI form. A stray object
+ * fails that field, and the schema's `.catch(() => ({}))` drops the WHOLE parse
+ * (`model`/`spec` included), surfacing as `missing_model` on resume of a
+ * custom-endpoint ephemeral agent (#14253). Convert it back to
+ * `{ thinking: boolean, thinkingBudget?, thinkingDisplay? }` so the replayed params
+ * round-trip cleanly (an explicit `display: 'omitted'` choice survives too).
+ */
+function normalizeThinkingParam(params: Record<string, unknown>): void {
+  const thinking = params.thinking;
+  if (thinking == null || typeof thinking !== 'object' || Array.isArray(thinking)) {
+    return;
+  }
+  const {
+    type,
+    display,
+    budget_tokens: budget,
+  } = thinking as {
+    type?: unknown;
+    display?: unknown;
+    budget_tokens?: unknown;
+  };
+  params.thinking = type !== 'disabled';
+  if (params.thinkingBudget == null && typeof budget === 'number') {
+    params.thinkingBudget = budget;
+  }
+  if (params.thinkingDisplay == null && typeof display === 'string') {
+    params.thinkingDisplay = display;
+  }
+}
+
+/**
+ * A non-default adaptive-thinking effort resolves into
+ * `invocationKwargs.output_config.effort` (see `configureReasoning`), while the
+ * request-body schema only accepts a top-level `effort`. Lift it back so the resumed
+ * turn keeps the paused run's effort, and drop `invocationKwargs` entirely — it's
+ * resolved transport config the compact-convo schema would discard anyway.
+ */
+function normalizeEffortParam(params: Record<string, unknown>): void {
+  const kwargs = params.invocationKwargs as { output_config?: { effort?: unknown } } | undefined;
+  if (kwargs == null || typeof kwargs !== 'object') {
+    return;
+  }
+  const effort = kwargs.output_config?.effort;
+  if (params.effort == null && typeof effort === 'string') {
+    params.effort = effort;
+  }
+  delete params.invocationKwargs;
+}
+
+/**
  * Strip credentials and server transport config from resolved model parameters before
  * they are persisted for resume replay. The initialized agent's `model_parameters` are
  * the resolved `llmConfig` — they carry provider secrets (`apiKey`, Azure key names,
  * Google `authOptions`, Bedrock `credentials`) and gateway config (`configuration`,
  * headers, base URLs). Resume re-resolves all of those server-side from env/config, so
  * only the user-level generation params (temperature, max tokens, custom endpoint
- * params, …) need to survive the round trip.
+ * params, …) need to survive the round trip. Provider-format params that conflict with
+ * the request-body schema on replay are normalized back to the UI form (see
+ * {@link normalizeThinkingParam}).
  */
 export function sanitizeResumeModelParameters(
   params: unknown,
@@ -343,7 +586,71 @@ export function sanitizeResumeModelParameters(
   if (params == null || typeof params !== 'object' || Array.isArray(params)) {
     return undefined;
   }
-  return sanitizeParamValue(params, 0) as Record<string, unknown>;
+  const sanitized = sanitizeParamValue(params, 0) as Record<string, unknown>;
+  normalizeThinkingParam(sanitized);
+  normalizeEffortParam(sanitized);
+  return sanitized;
+}
+
+/** Bedrock body params its compact schema accepts; hand-listed because
+ *  `bedrockInputSchema` wraps the pick in a transform, hiding `.shape`. */
+const BEDROCK_PARAM_KEYS = [
+  'region',
+  'system',
+  'maxTokens',
+  'reasoning_effort',
+  'additionalModelRequestFields',
+];
+
+/** Schema-accepted keys owned elsewhere: replayed via {@link RESUME_CONTEXT_KEYS}
+ *  (`model`, `spec`, `promptPrefix`, `modelLabel`) or derived server-side / identity
+ *  fields the resume request must keep as its own. */
+const RESUME_PARAM_EXCLUDED = new Set([
+  'model',
+  'spec',
+  'iconURL',
+  'greeting',
+  'modelLabel',
+  'promptPrefix',
+  'chatProjectId',
+]);
+
+/**
+ * Request-body generation params worth replaying on resume: the union of the
+ * compact-convo schemas' fields. Only these keys can influence the rebuilt run —
+ * `buildOptions` derives `model_parameters` from the PARSED body, and
+ * `parseCompactConvo` strips everything else.
+ */
+const RESUME_PARAM_KEYS: string[] = Array.from(
+  new Set(
+    [openAIBaseSchema, anthropicBaseSchema, googleBaseSchema]
+      .flatMap((schema) => Object.keys(schema.shape))
+      .concat(BEDROCK_PARAM_KEYS),
+  ),
+).filter((key) => !RESUME_PARAM_EXCLUDED.has(key));
+
+/**
+ * Capture the model parameters to replay on resume. The paused request body is the
+ * primary source — its fields are UI-form by construction (they already round-tripped
+ * `parseCompactConvo` on the original turn), so replaying them can't trip the schema.
+ * The resolved llmConfig only fills gaps: it's provider-format, where params are
+ * renamed (`maxOutputTokens` → `maxTokens`, `top_p` → `topP`), relocated
+ * (`effort` → `invocationKwargs`), or retyped (`thinking` → object) — the schema
+ * silently drops or, worse, fails on them (see the `normalize*` helpers, #14253).
+ */
+export function captureResumeModelParameters(
+  body: Record<string, unknown> | undefined | null,
+  resolvedParams: unknown,
+): Record<string, unknown> | undefined {
+  const captured = sanitizeResumeModelParameters(resolvedParams) ?? {};
+  if (body != null && typeof body === 'object') {
+    for (const key of RESUME_PARAM_KEYS) {
+      if (body[key] !== undefined) {
+        captured[key] = sanitizeParamValue(body[key], 1);
+      }
+    }
+  }
+  return Object.keys(captured).length > 0 ? captured : undefined;
 }
 
 /** Extract the graph-determining fields from a request body for durable replay. */
@@ -385,6 +692,38 @@ export function applyResumeContext(
   }
 }
 
+/** Request-envelope fields that resolved provider params must never replace. */
+const RESUME_REQUEST_CONTROL_KEYS = new Set<string>([
+  ...RESUME_CONTEXT_KEYS,
+  'conversationId',
+  'generationCreatedAt',
+  'generationProtocolVersion',
+  'actionId',
+  'decisions',
+  'answer',
+  'answers',
+  'isTemporary',
+]);
+
+/**
+ * Replay captured generation parameters without allowing provider configuration to
+ * replace routing, graph identity, or resume-action fields. This guard also makes
+ * pending actions captured by older versions safe to resume after an upgrade.
+ */
+export function applyResumeModelParameters(
+  body: Record<string, unknown> | undefined | null,
+  params: unknown,
+): void {
+  if (body == null || params == null || typeof params !== 'object' || Array.isArray(params)) {
+    return;
+  }
+  for (const [key, value] of Object.entries(params as Record<string, unknown>)) {
+    if (!RESUME_REQUEST_CONTROL_KEYS.has(key)) {
+      body[key] = value;
+    }
+  }
+}
+
 export function computeAgentRequestFingerprint(fields: AgentRequestFingerprintFields): string {
   const canonical = JSON.stringify({
     endpoint: fields.endpoint ?? null,
@@ -394,6 +733,9 @@ export function computeAgentRequestFingerprint(fields: AgentRequestFingerprintFi
     spec: fields.spec ?? null,
     promptPrefix: fields.promptPrefix ?? null,
     ephemeralAgent: normalizeEphemeralAgent(fields.ephemeralAgent),
+    ...(Object.prototype.hasOwnProperty.call(fields, 'codeApprovalMode')
+      ? { codeApprovalMode: fields.codeApprovalMode ?? null }
+      : {}),
   });
   return createHash('sha256').update(canonical).digest('hex');
 }
@@ -410,6 +752,25 @@ export function buildPendingAction(
   ctx: PendingActionContext,
 ): Agents.PendingAction {
   const createdAt = Date.now();
+  const ttlExpiresAt = typeof ctx.ttlMs === 'number' ? createdAt + ctx.ttlMs : undefined;
+  let absoluteExpiresAt: number | undefined;
+  if (typeof ctx.expiresAt === 'number') {
+    absoluteExpiresAt = ctx.expiresAt;
+  } else if (ctx.expiresAt instanceof Date) {
+    absoluteExpiresAt = ctx.expiresAt.getTime();
+  } else if (typeof ctx.expiresAt === 'string') {
+    absoluteExpiresAt = new Date(ctx.expiresAt).getTime();
+  }
+  const finiteAbsoluteExpiresAt = Number.isFinite(absoluteExpiresAt)
+    ? absoluteExpiresAt
+    : undefined;
+  let expiresAt = ttlExpiresAt;
+  if (finiteAbsoluteExpiresAt != null) {
+    expiresAt =
+      ttlExpiresAt == null
+        ? finiteAbsoluteExpiresAt
+        : Math.min(ttlExpiresAt, finiteAbsoluteExpiresAt);
+  }
   return {
     actionId: ctx.actionId ?? randomUUID(),
     streamId: ctx.streamId,
@@ -418,16 +779,18 @@ export function buildPendingAction(
     responseMessageId: ctx.responseMessageId,
     payload,
     createdAt,
-    expiresAt: typeof ctx.ttlMs === 'number' ? createdAt + ctx.ttlMs : undefined,
+    expiresAt,
     interruptId: ctx.interruptId,
     threadId: ctx.threadId,
     requestFingerprint: ctx.requestFingerprint,
     resumeContext: ctx.resumeContext,
+    codeExecutionBinding: ctx.codeExecutionBinding,
   };
 }
 
 /**
- * Client-facing projection of a pending action. `requestFingerprint` and `resumeContext`
+ * Client-facing projection of a pending action. `requestFingerprint`, `resumeContext`, and
+ * `codeExecutionBinding`
  * are server-only replay state — `resumeContext` in particular carries the resolved
  * model parameters — so every copy that leaves the server (SSE, status, resume state)
  * must go through this. The full record stays in the job store for the resume route.
@@ -441,6 +804,7 @@ export function toClientPendingAction(
   const {
     requestFingerprint: _requestFingerprint,
     resumeContext: _resumeContext,
+    codeExecutionBinding: _codeExecutionBinding,
     ...clientSafe
   } = pendingAction;
   return clientSafe;

@@ -5,16 +5,16 @@ services:
   api:
     container_name: LibreChat
     ports:
-      - "${PORT}:${PORT}"
+      - '${PORT}:${PORT}'
     depends_on:
       - mongodb
       - searxng-core
       - rag_api
     image: registry.librechat.ai/danny-avila/librechat-dev:latest
     restart: always
-    user: "${UID}:${GID}"
+    user: '${UID}:${GID}'
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - 'host.docker.internal:host-gateway'
     env_file:
       - .env
     environment:
@@ -25,6 +25,7 @@ services:
       - HOST=0.0.0.0
       - MONGO_URI=mongodb://mongodb:27017/LibreChat
       - MEILI_HOST=http://meilisearch:7700
+      - LIBRECHAT_TEMP_CREDENTIALS_PATH=/app/data/.env.temp
       - RAG_PORT=${RAG_PORT:-8000}
       - RAG_API_URL=http://rag_api:${RAG_PORT:-8000}
       - PROXY=${PROXY:-}
@@ -58,11 +59,12 @@ services:
       - ./aeonthic-whitelabel/manifest.webmanifest:/app/client/public/manifest.webmanifest:ro
       - ./aeonthic-whitelabel/manifest.webmanifest:/app/client/dist/manifest.webmanifest:ro
       - ./aeonthic-whitelabel/index.html:/app/client/dist/index.html:ro
+      - librechat-data:/app/data
   admin-panel:
     container_name: admin-panel
     image: registry.librechat.ai/clickhouse/librechat-admin-panel:latest
     ports:
-      - "${ADMIN_PANEL_PORT:-3000}:3000"
+      - '${ADMIN_PANEL_PORT:-3000}:3000'
     depends_on:
       - api
     restart: always
@@ -78,7 +80,7 @@ services:
     container_name: chat-mongodb
     image: mongo:8.0.20
     restart: always
-    user: "${UID}:${GID}"
+    user: '${UID}:${GID}'
     volumes:
       - ./data-node:/data/db
     command: mongod --noauth
@@ -86,7 +88,7 @@ services:
     container_name: chat-meilisearch
     image: getmeili/meilisearch:v1.35.1
     restart: always
-    user: "${UID}:${GID}"
+    user: '${UID}:${GID}'
     environment:
       - MEILI_HOST=http://meilisearch:7700
       - MEILI_NO_ANALYTICS=true
@@ -137,3 +139,4 @@ volumes:
   pgdata2:
   core-data:
   valkey-data:
+  librechat-data:

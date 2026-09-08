@@ -5,9 +5,12 @@ export enum QueryKeys {
   sharedLinks = 'sharedLinks',
   allConversations = 'allConversations',
   archivedConversations = 'archivedConversations',
+  pinnedConversations = 'pinnedConversations',
   searchConversations = 'searchConversations',
   conversation = 'conversation',
   searchEnabled = 'searchEnabled',
+  langfuseConnection = 'langfuseConnection',
+  langfuseSessionLink = 'langfuseSessionLink',
   user = 'user',
   name = 'name', // user key name
   models = 'models',
@@ -20,6 +23,8 @@ export enum QueryKeys {
   availablePlugins = 'availablePlugins',
   startupConfig = 'startupConfig',
   axiomSession = 'axiomSession',
+  insights = 'insights',
+  insightsAccess = 'insightsAccess',
   assistants = 'assistants',
   assistant = 'assistant',
   agents = 'agents',
@@ -86,18 +91,32 @@ export enum QueryKeys {
   skillStates = 'skillStates',
   /* General user favorites */
   favorites = 'favorites',
+  /* Scheduled chats */
+  schedules = 'schedules',
+  schedule = 'schedule',
+  parentSubagents = 'parentSubagents',
+  subagentThread = 'subagentThread',
+  codeEnvironments = 'codeEnvironments',
+  agentQueuedTurns = 'agentQueuedTurns',
 }
 
 // Dynamic query keys that require parameters
 export const DynamicQueryKeys = {
   agentFiles: (agentId: string) => ['agentFiles', agentId] as const,
+  codeEnvironmentStatus: (id: string) => [QueryKeys.codeEnvironments, id, 'status'] as const,
 } as const;
 
 export enum MutationKeys {
+  subagentControl = 'subagentControl',
+  enqueueAgentQueuedTurn = 'enqueueAgentQueuedTurn',
+  cancelAgentQueuedTurn = 'cancelAgentQueuedTurn',
+  updateLangfuseConnection = 'updateLangfuseConnection',
+  testLangfuseConnection = 'testLangfuseConnection',
   createAgentApiKey = 'createAgentApiKey',
   deleteAgentApiKey = 'deleteAgentApiKey',
   fileUpload = 'fileUpload',
   fileDelete = 'fileDelete',
+  fileUsage = 'fileUsage',
   updatePreset = 'updatePreset',
   deletePreset = 'deletePreset',
   loginUser = 'loginUser',
@@ -114,6 +133,7 @@ export enum MutationKeys {
   deleteAgentAction = 'deleteAgentAction',
   revertAgentVersion = 'revertAgentVersion',
   deleteUser = 'deleteUser',
+  updateUserPreferences = 'updateUserPreferences',
   updateRole = 'updateRole',
   enableTwoFactor = 'enableTwoFactor',
   verifyTwoFactor = 'verifyTwoFactor',
@@ -129,4 +149,12 @@ export enum MutationKeys {
   deleteSkillNode = 'deleteSkillNode',
   updateSkillNodeContent = 'updateSkillNodeContent',
   convoPin = 'convoPin',
+  archiveAllConversations = 'archiveAllConversations',
+  createSchedule = 'createSchedule',
+  updateSchedule = 'updateSchedule',
+  deleteSchedule = 'deleteSchedule',
+  runSchedule = 'runSchedule',
+  pairCodeEnvironment = 'pairCodeEnvironment',
+  updateCodeEnvironmentSettings = 'updateCodeEnvironmentSettings',
+  deleteCodeEnvironment = 'deleteCodeEnvironment',
 }

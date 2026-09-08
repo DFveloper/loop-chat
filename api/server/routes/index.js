@@ -3,6 +3,9 @@ const assistants = require('./assistants');
 const categories = require('./categories');
 const adminAuth = require('./admin/auth');
 const adminConfig = require('./admin/config');
+const adminCodeEnvironments = require('./admin/code');
+const codeEnvironments = require('./code-environments');
+const adminLangfuse = require('./admin/langfuse');
 const adminGrants = require('./admin/grants');
 const adminGroups = require('./admin/groups');
 const adminRoles = require('./admin/roles');
@@ -16,6 +19,7 @@ const memories = require('./memories');
 const presets = require('./presets');
 const projects = require('./projects');
 const prompts = require('./prompts');
+const schedules = require('./schedules');
 const skills = require('./skills');
 const balance = require('./balance');
 const actions = require('./actions');
@@ -37,14 +41,19 @@ const user = require('./user');
 const mcp = require('./mcp');
 const rum = require('./rum');
 const axiom = require('./axiom').router;
+const insights = require('./insights');
 
 module.exports = {
+  insights,
   rum,
   axiom,
   mcp,
   auth,
   adminAuth,
   adminConfig,
+  adminCodeEnvironments,
+  codeEnvironments,
+  adminLangfuse,
   adminGrants,
   adminGroups,
   adminRoles,
@@ -67,6 +76,7 @@ module.exports = {
   models,
   prompts,
   projects,
+  schedules,
   skills,
   actions,
   presets,

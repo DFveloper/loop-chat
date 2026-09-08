@@ -1,4 +1,5 @@
 import { Schema } from 'mongoose';
+import { CODE_APPROVAL_MODES } from 'librechat-data-provider';
 
 // @ts-ignore
 export const conversationPreset: {
@@ -116,6 +117,10 @@ export const conversationPreset: {
   agent_id: {
     type: StringConstructor;
   };
+  codeApprovalMode: {
+    type: StringConstructor;
+    enum: string[];
+  };
   /* assistants */
   assistant_id: {
     type: StringConstructor;
@@ -181,6 +186,13 @@ export const conversationPreset: {
     type: StringConstructor;
   };
   reasoning_summary: {
+    type: StringConstructor;
+  };
+  /** Responses API reasoning mode (standard/pro) + context */
+  reasoning_mode: {
+    type: StringConstructor;
+  };
+  reasoning_context: {
     type: StringConstructor;
   };
   /** Verbosity control */
@@ -292,6 +304,10 @@ export const conversationPreset: {
   agent_id: {
     type: String,
   },
+  codeApprovalMode: {
+    type: String,
+    enum: [...CODE_APPROVAL_MODES],
+  },
   /* assistants */
   assistant_id: {
     type: String,
@@ -347,6 +363,13 @@ export const conversationPreset: {
     type: String,
   },
   reasoning_summary: {
+    type: String,
+  },
+  /** Responses API reasoning mode (standard/pro) + context */
+  reasoning_mode: {
+    type: String,
+  },
+  reasoning_context: {
     type: String,
   },
   /** Verbosity control */

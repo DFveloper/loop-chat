@@ -86,6 +86,38 @@ describe('File Methods', () => {
       expect(file?.file_id).toBe(fileId);
       expect(file?.expiresAt).toBeUndefined();
     });
+
+    it('persists independent Code API pointers for both execution profiles', async () => {
+      const defaultRef = {
+        kind: 'user' as const,
+        id: 'user-1',
+        storage_session_id: 'default-session',
+        file_id: 'default-file',
+        executionProfile: 'default' as const,
+      };
+      const statefulRef = {
+        ...defaultRef,
+        storage_session_id: 'stateful-session',
+        file_id: 'stateful-file',
+        executionProfile: 'stateful' as const,
+      };
+
+      const file = await fileMethods.createFile({
+        file_id: uuidv4(),
+        user: new mongoose.Types.ObjectId(),
+        filename: 'dual-profile.txt',
+        filepath: '/uploads/dual-profile.txt',
+        type: 'text/plain',
+        bytes: 10,
+        metadata: {
+          codeEnvRef: defaultRef,
+          codeEnvRefs: { default: defaultRef, stateful: statefulRef },
+        },
+      });
+
+      expect(file?.metadata?.codeEnvRefs?.default?.file_id).toBe('default-file');
+      expect(file?.metadata?.codeEnvRefs?.stateful?.file_id).toBe('stateful-file');
+    });
   });
 
   describe('claimCodeFile', () => {
@@ -119,6 +151,64 @@ describe('File Methods', () => {
       expect(tenantB.file_id).toBe('file-tenant-b');
       expect(tenantB.tenantId).toBe('tenant-b');
       expect(tenantAAgain.file_id).toBe('file-tenant-a');
+    });
+
+    it('does not bump updatedAt on re-claim (id reservation, not a content write)', async () => {
+      const userId = new mongoose.Types.ObjectId().toString();
+      const File = mongoose.models.File;
+
+      await fileMethods.claimCodeFile({
+        filename: 'stable.csv',
+        conversationId: 'conversation-ts',
+        file_id: 'stable-file',
+        user: userId,
+      });
+      const written = new Date('2024-01-01T00:00:00.000Z');
+      await File.updateOne(
+        { file_id: 'stable-file' },
+        { $set: { updatedAt: written } },
+        { timestamps: false },
+      );
+
+      /** The background harvest's out-of-order guard compares `updatedAt`
+       *  against the harvest start; a claim bumping it would make every
+       *  existing filename look freshly written and misfire the guard. */
+      const reclaimed = await fileMethods.claimCodeFile({
+        filename: 'stable.csv',
+        conversationId: 'conversation-ts',
+        file_id: 'stable-file-second',
+        user: userId,
+      });
+      expect(reclaimed.file_id).toBe('stable-file');
+      expect(new Date(reclaimed.updatedAt as unknown as string).getTime()).toBe(written.getTime());
+    });
+
+    it('stamps sourceDispatchedAt on claim INSERT only (existing claims untouched)', async () => {
+      const userId = new mongoose.Types.ObjectId().toString();
+
+      const inserted = await fileMethods.claimCodeFile({
+        filename: 'stamped.csv',
+        conversationId: 'conversation-stamp',
+        file_id: 'stamped-file',
+        user: userId,
+        sourceDispatchedAt: 111,
+      });
+      expect(
+        (inserted.metadata as { sourceDispatchedAt?: number } | undefined)?.sourceDispatchedAt,
+      ).toBe(111);
+
+      /** A later claimant's stamp must not overwrite the owner's. */
+      const reclaimed = await fileMethods.claimCodeFile({
+        filename: 'stamped.csv',
+        conversationId: 'conversation-stamp',
+        file_id: 'stamped-file-second',
+        user: userId,
+        sourceDispatchedAt: 222,
+      });
+      expect(reclaimed.file_id).toBe('stamped-file');
+      expect(
+        (reclaimed.metadata as { sourceDispatchedAt?: number } | undefined)?.sourceDispatchedAt,
+      ).toBe(111);
     });
 
     it('keeps non-tenant code output claims in the legacy namespace', async () => {
@@ -290,9 +380,195 @@ describe('File Methods', () => {
         true,
       );
 
-      const files = await fileMethods.getExpiredFiles(100, now);
+      const files = await fileMethods.getExpiredFiles(100, { now });
 
       expect(files.map((file) => file.file_id)).toEqual([expiredFileId]);
+    });
+
+    /** Seeds a sweep-eligible file, then drives its retry state through the
+     *  same methods the sweep itself uses. */
+    const seedExpiredFile = async ({
+      file_id,
+      expiredAt,
+      attempts = 0,
+      retryAt,
+    }: {
+      file_id: string;
+      expiredAt: Date;
+      attempts?: number;
+      retryAt?: Date;
+    }) => {
+      await fileMethods.createFile(
+        {
+          file_id,
+          user: new mongoose.Types.ObjectId(),
+          filename: `${file_id}.txt`,
+          filepath: `/uploads/${file_id}.txt`,
+          type: 'text/plain',
+          bytes: 100,
+          expiredAt,
+        },
+        true,
+      );
+      for (let i = 0; i < attempts; i++) {
+        await fileMethods.incrementFileDeletionAttempts(file_id);
+      }
+      if (retryAt) {
+        await fileMethods.deferExpiredFile(file_id, retryAt);
+      }
+    };
+
+    it('holds back files whose deletion backoff has not elapsed', async () => {
+      const now = new Date('2030-01-01T00:00:00.000Z');
+      const readyFileId = uuidv4();
+      const backedOffFileId = uuidv4();
+
+      await seedExpiredFile({
+        file_id: backedOffFileId,
+        expiredAt: new Date('2029-12-01T00:00:00.000Z'),
+        attempts: 2,
+        retryAt: new Date('2030-01-01T00:00:01.000Z'),
+      });
+      await seedExpiredFile({
+        file_id: readyFileId,
+        expiredAt: new Date('2029-12-31T00:00:00.000Z'),
+        attempts: 2,
+        retryAt: new Date('2029-12-31T23:00:00.000Z'),
+      });
+
+      const files = await fileMethods.getExpiredFiles(100, { now });
+
+      expect(files.map((file) => file.file_id)).toEqual([readyFileId]);
+    });
+
+    it('holds a parked file back without excluding it for good', async () => {
+      const parkedFileId = uuidv4();
+      const retriableFileId = uuidv4();
+
+      /* The parked file expired first, so with nothing holding it back it
+       * sorts to the front of every batch and a limit-sized run of them
+       * starves everything that expired afterwards. */
+      await seedExpiredFile({
+        file_id: parkedFileId,
+        expiredAt: new Date('2029-01-01T00:00:00.000Z'),
+        attempts: 10,
+        retryAt: new Date('2030-02-01T00:00:00.000Z'),
+      });
+      await seedExpiredFile({
+        file_id: retriableFileId,
+        expiredAt: new Date('2029-12-31T00:00:00.000Z'),
+        attempts: 9,
+      });
+
+      const parked = await fileMethods.getExpiredFiles(100, {
+        now: new Date('2030-01-01T00:00:00.000Z'),
+      });
+      expect(parked.map((file) => file.file_id)).toEqual([retriableFileId]);
+
+      /* Nothing is excluded permanently — a record reused for different
+       * content in the meantime gets its object swept rather than stranded. */
+      const afterPark = await fileMethods.getExpiredFiles(100, {
+        now: new Date('2030-02-01T00:00:01.000Z'),
+      });
+      expect(afterPark.map((file) => file.file_id)).toEqual([parkedFileId, retriableFileId]);
+    });
+
+    it('leaves retry state alone on writes that touch the record', async () => {
+      const fileId = uuidv4();
+      await seedExpiredFile({
+        file_id: fileId,
+        expiredAt: new Date('2029-01-01T00:00:00.000Z'),
+        attempts: 4,
+        retryAt: new Date('2030-02-01T00:00:00.000Z'),
+      });
+
+      /* `prepareImagesLocal` clears the upload TTL with nothing but the id
+       * on every reuse of an image, the deferred preview only transitions
+       * `status`, and `processCodeOutput` repurposes a row for new content.
+       * None of them need to reason about sweep bookkeeping: the deferral
+       * is a deadline, so the worst a survivor can do is delay. */
+      await fileMethods.updateFile({ file_id: fileId });
+      await fileMethods.updateFile({ file_id: fileId, status: 'ready' });
+
+      const [file] = (await fileMethods.getFiles({ file_id: fileId }))!;
+      expect(file.deletionAttempts).toBe(4);
+      expect(file.deletionRetryAt).toEqual(new Date('2030-02-01T00:00:00.000Z'));
+    });
+
+    it('records retry bookkeeping without posing as a content write', async () => {
+      const fileId = uuidv4();
+      await seedExpiredFile({ file_id: fileId, expiredAt: new Date('2029-01-01T00:00:00.000Z') });
+      const [before] = (await fileMethods.getFiles({ file_id: fileId }))!;
+
+      /* `processCodeOutput` falls back to `updatedAt` as the writer-order
+       * stamp for records predating `metadata.sourceDispatchedAt`. A sweep
+       * that bumped it would look like a newer content writer and a
+       * background harvest would drop its attachment. */
+      await fileMethods.incrementFileDeletionAttempts(fileId);
+      await fileMethods.deferExpiredFile(fileId, new Date('2030-06-01T00:00:00.000Z'));
+
+      const [after] = (await fileMethods.getFiles({ file_id: fileId }))!;
+      expect(after.deletionAttempts).toBe(1);
+      expect(after.updatedAt).toEqual(before.updatedAt);
+    });
+  });
+
+  describe('deferExpiredFile', () => {
+    const createDeferrableFile = async (file_id: string) => {
+      await fileMethods.createFile(
+        {
+          file_id,
+          user: new mongoose.Types.ObjectId(),
+          filename: 'deferred.txt',
+          filepath: '/uploads/deferred.txt',
+          type: 'text/plain',
+          bytes: 100,
+          expiredAt: new Date('2029-12-31T00:00:00.000Z'),
+        },
+        true,
+      );
+    };
+
+    it('stamps the next retry and counts the attempt', async () => {
+      const fileId = uuidv4();
+      const retryAt = new Date('2030-02-01T00:00:00.000Z');
+      await createDeferrableFile(fileId);
+
+      expect(await fileMethods.incrementFileDeletionAttempts(fileId)).toBe(1);
+      await fileMethods.deferExpiredFile(fileId, retryAt);
+
+      const [file] = (await fileMethods.getFiles({ file_id: fileId }))!;
+      expect(file.deletionAttempts).toBe(1);
+      expect(file.deletionRetryAt).toEqual(retryAt);
+    });
+
+    it('hands concurrent sweeps distinct attempt numbers', async () => {
+      const fileId = uuidv4();
+      await createDeferrableFile(fileId);
+
+      /* Two nodes recording a failure for the same file in the same pass.
+       * Deriving the attempt from the queried snapshot would give both the
+       * same number and neither would see the cap being reached. */
+      const attempts = await Promise.all([
+        fileMethods.incrementFileDeletionAttempts(fileId),
+        fileMethods.incrementFileDeletionAttempts(fileId),
+        fileMethods.incrementFileDeletionAttempts(fileId),
+      ]);
+
+      expect([...attempts].sort()).toEqual([1, 2, 3]);
+    });
+
+    it('never pulls a deferral earlier than one already committed', async () => {
+      const fileId = uuidv4();
+      const later = new Date('2030-02-01T00:00:00.000Z');
+      const earlier = new Date('2030-01-01T00:00:00.000Z');
+      await createDeferrableFile(fileId);
+
+      await fileMethods.deferExpiredFile(fileId, later);
+      await fileMethods.deferExpiredFile(fileId, earlier);
+
+      const [file] = (await fileMethods.getFiles({ file_id: fileId }))!;
+      expect(file.deletionRetryAt).toEqual(later);
     });
   });
 
@@ -1062,6 +1338,197 @@ describe('File Methods', () => {
       expect(otherFile?.usage).toBe(0);
       expect(otherFile?.temp_file_id).toBe('tmp-other');
       expect(otherFile?.expiresAt).toBeDefined();
+    });
+  });
+
+  describe('extendFilesTTL', () => {
+    const HOUR = 3_600_000;
+    const HOLD = { renewMs: 24 * HOUR, maxLifetimeMs: 48 * HOUR };
+
+    const seedTempFile = async (
+      userId: mongoose.Types.ObjectId,
+      expiresAt: Date,
+      createdAt?: Date,
+    ) => {
+      const fileId = uuidv4();
+      await fileMethods.createFile({
+        file_id: fileId,
+        user: userId,
+        filename: `${fileId}.txt`,
+        filepath: `/uploads/${fileId}.txt`,
+        type: 'text/plain',
+        bytes: 100,
+      });
+      await mongoose.models.File.updateOne(
+        { file_id: fileId },
+        { $set: { expiresAt } },
+        { timestamps: false },
+      );
+      /** Mongoose strips the immutable `createdAt` from updates, so backdating
+       *  must go through the raw driver to actually land. */
+      if (createdAt) {
+        await mongoose.models.File.collection.updateOne(
+          { file_id: fileId },
+          { $set: { createdAt } },
+        );
+      }
+      return fileId;
+    };
+
+    const readFile = async (fileId: string) =>
+      (await mongoose.models.File.findOne({ file_id: fileId })
+        .lean<{ createdAt: Date; expiresAt?: Date }>()
+        .exec())!;
+
+    it('widens the TTL toward the renewal window without unsetting it', async () => {
+      const userId = new mongoose.Types.ObjectId();
+      const fileId = await seedTempFile(userId, new Date(Date.now() + 60_000));
+
+      const count = await fileMethods.extendFilesTTL([fileId], HOLD, { user: String(userId) });
+
+      expect(count).toBe(1);
+      const file = await readFile(fileId);
+      expect(file.expiresAt).toBeDefined();
+      expect(file.expiresAt!.getTime()).toBeGreaterThan(Date.now() + 23 * HOUR);
+      expect(file.expiresAt!.getTime()).toBeLessThanOrEqual(
+        file.createdAt.getTime() + HOLD.maxLifetimeMs,
+      );
+    });
+
+    /** The bound that makes the endpoint safe to expose: every renewal is
+     *  clamped to createdAt + maxLifetimeMs, so replaying the call converges
+     *  on a ceiling instead of advancing a window at a time. */
+    it('clamps every renewal to the ceiling, however often it is replayed', async () => {
+      const userId = new mongoose.Types.ObjectId();
+      const fileId = await seedTempFile(userId, new Date(Date.now() + 60_000));
+      const ceilingHold = { renewMs: 24 * HOUR, maxLifetimeMs: 10 * 60_000 };
+      const { createdAt } = await readFile(fileId);
+
+      const first = await fileMethods.extendFilesTTL([fileId], ceilingHold, {
+        user: String(userId),
+      });
+      expect(first).toBe(1);
+
+      for (let i = 0; i < 5; i++) {
+        expect(
+          await fileMethods.extendFilesTTL([fileId], ceilingHold, { user: String(userId) }),
+        ).toBe(0);
+      }
+
+      const file = await readFile(fileId);
+      expect(file.expiresAt!.getTime()).toBe(createdAt.getTime() + ceilingHold.maxLifetimeMs);
+      /* The renewal window alone would have granted a full day. */
+      expect(file.expiresAt!.getTime()).toBeLessThan(Date.now() + HOUR);
+    });
+
+    /** Renewal is measured from now, so a queue still draining across
+     *  successive runs keeps its attachments past the first hold. */
+    it('renews from now while the ceiling still allows it', async () => {
+      const userId = new mongoose.Types.ObjectId();
+      const twoHoursAgo = new Date(Date.now() - 2 * HOUR);
+      const fileId = await seedTempFile(userId, new Date(Date.now() + 60_000), twoHoursAgo);
+
+      const count = await fileMethods.extendFilesTTL(
+        [fileId],
+        { renewMs: HOUR, maxLifetimeMs: 24 * HOUR },
+        { user: String(userId) },
+      );
+
+      expect(count).toBe(1);
+      const file = await readFile(fileId);
+      /* Anchoring to createdAt alone would have expired this an hour ago. */
+      expect(file.expiresAt!.getTime()).toBeGreaterThan(Date.now() + 50 * 60_000);
+    });
+
+    it("applies each file's own ceiling within a single batch", async () => {
+      const userId = new mongoose.Types.ObjectId();
+      const soon = new Date(Date.now() + 60_000);
+      const freshId = await seedTempFile(userId, soon);
+      const agedId = await seedTempFile(userId, soon, new Date(Date.now() - 47 * HOUR));
+      const releasedId = await seedTempFile(userId, soon);
+      await fileMethods.updateFileUsage({ file_id: releasedId, user: String(userId) });
+
+      const count = await fileMethods.extendFilesTTL([freshId, agedId, releasedId], HOLD, {
+        user: String(userId),
+      });
+
+      expect(count).toBe(2);
+      const fresh = await readFile(freshId);
+      expect(fresh.expiresAt!.getTime()).toBeGreaterThan(Date.now() + 23 * HOUR);
+      const aged = await readFile(agedId);
+      expect(aged.expiresAt!.getTime()).toBe(aged.createdAt.getTime() + HOLD.maxLifetimeMs);
+      expect(aged.expiresAt!.getTime()).toBeLessThan(Date.now() + 2 * HOUR);
+      const released = await readFile(releasedId);
+      expect(released.expiresAt).toBeUndefined();
+    });
+
+    it('does not resurrect a TTL on an already-released file', async () => {
+      const userId = new mongoose.Types.ObjectId();
+      const fileId = await seedTempFile(userId, new Date(Date.now() + 60_000));
+      await fileMethods.updateFileUsage({ file_id: fileId, user: String(userId) });
+
+      const count = await fileMethods.extendFilesTTL([fileId], HOLD, { user: String(userId) });
+
+      expect(count).toBe(0);
+      const file = await readFile(fileId);
+      expect(file.expiresAt).toBeUndefined();
+    });
+
+    it('never moves an expiry earlier', async () => {
+      const userId = new mongoose.Types.ObjectId();
+      const farOut = new Date(Date.now() + 7 * 24 * HOUR);
+      const fileId = await seedTempFile(userId, farOut);
+
+      const count = await fileMethods.extendFilesTTL([fileId], HOLD, { user: String(userId) });
+
+      expect(count).toBe(0);
+      const file = await readFile(fileId);
+      expect(file.expiresAt!.getTime()).toBe(farOut.getTime());
+    });
+
+    it("leaves another user's file untouched", async () => {
+      const ownerId = new mongoose.Types.ObjectId();
+      const attackerId = new mongoose.Types.ObjectId();
+      const soon = new Date(Date.now() + 60_000);
+      const fileId = await seedTempFile(ownerId, soon);
+
+      const count = await fileMethods.extendFilesTTL([fileId], HOLD, {
+        user: String(attackerId),
+      });
+
+      expect(count).toBe(0);
+      const file = await readFile(fileId);
+      expect(file.expiresAt!.getTime()).toBe(soon.getTime());
+    });
+
+    it('is a no-op without an owner scope rather than a cross-user update', async () => {
+      const userId = new mongoose.Types.ObjectId();
+      const soon = new Date(Date.now() + 60_000);
+      const fileId = await seedTempFile(userId, soon);
+
+      const count = await fileMethods.extendFilesTTL([fileId], HOLD, { user: '' } as {
+        user: string;
+      });
+
+      expect(count).toBe(0);
+      const file = await readFile(fileId);
+      expect(file.expiresAt!.getTime()).toBe(soon.getTime());
+    });
+
+    it('is a no-op for a non-positive hold', async () => {
+      const userId = new mongoose.Types.ObjectId();
+      const soon = new Date(Date.now() + 60_000);
+      const fileId = await seedTempFile(userId, soon);
+      const owner = { user: String(userId) };
+
+      expect(
+        await fileMethods.extendFilesTTL([fileId], { renewMs: 0, maxLifetimeMs: 0 }, owner),
+      ).toBe(0);
+      expect(
+        await fileMethods.extendFilesTTL([fileId], { renewMs: -1, maxLifetimeMs: -1 }, owner),
+      ).toBe(0);
+      const file = await readFile(fileId);
+      expect(file.expiresAt!.getTime()).toBe(soon.getTime());
     });
   });
 

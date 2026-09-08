@@ -9,6 +9,10 @@ export type FileOwnerScope = {
   tenantId?: string | null;
 };
 
+export type ExpiredFileQueryOptions = {
+  now?: Date;
+};
+
 function withOwnerScope<T extends FilterQuery<IMongoFile>>(
   filter: T,
   ownerScope?: FileOwnerScope,
@@ -35,7 +39,9 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
     _sortOptions?: Record<string, SortOrder> | null,
     selectFields?: Record<string, 0 | 1> | string | null,
   ) => Promise<IMongoFile[] | null>;
-  getExpiredFiles: (limit?: number, now?: Date) => Promise<IMongoFile[]>;
+  getExpiredFiles: (limit?: number, options?: ExpiredFileQueryOptions) => Promise<IMongoFile[]>;
+  incrementFileDeletionAttempts: (file_id: string) => Promise<number>;
+  deferExpiredFile: (file_id: string, deletionRetryAt: Date) => Promise<void>;
   getToolFilesByIds: (
     fileIds: string[],
     toolResourceSet?: Set<EToolResources>,
@@ -53,6 +59,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
     file_id: string;
     user: string;
     tenantId?: string | null;
+    sourceDispatchedAt?: number;
   }) => Promise<IMongoFile>;
   createFile: (data: Partial<IMongoFile>, disableTTL?: boolean) => Promise<IMongoFile | null>;
   updateFile: (
@@ -81,6 +88,11 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
     fileIds?: string[],
     options?: { user?: string; tenantId?: string | null },
   ) => Promise<IMongoFile[]>;
+  extendFilesTTL: (
+    fileIds: string[],
+    hold: { renewMs: number; maxLifetimeMs: number },
+    owner: { user: string; tenantId?: string | null },
+  ) => Promise<number>;
   sweepOrphanedPreviews: (maxAgeMs?: number) => Promise<number>;
 } {
   /**
@@ -124,12 +136,78 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
     return await query.sort(sortOptions).lean<IMongoFile[]>();
   }
 
-  async function getExpiredFiles(limit = 100, now: Date = new Date()): Promise<IMongoFile[]> {
+  /**
+   * Expired files the sweep may attempt right now, oldest deadline first.
+   *
+   * `deletionRetryAt` is the only thing holding a file back: one that keeps
+   * failing is deferred on a growing backoff, and one that exhausts its
+   * attempts is parked far enough out to stop crowding the batch. Without
+   * it a permanently undeletable file sorts to the front of this bounded
+   * batch on every pass and starves every file that expired after it.
+   *
+   * The deferral is deliberately a deadline rather than a flag, so nothing
+   * here is ever excluded for good. File records are reused across content
+   * lifecycles — a code-output row is repurposed for a repeated
+   * `(filename, conversationId)`, keeping fields it was not asked to change
+   * — so bookkeeping that permanently excluded a row would eventually
+   * strand a *different* object than the one it was recorded against. A
+   * deadline can only ever delay that; it cannot lose it.
+   *
+   * An absent field means "never attempted", so records written before it
+   * existed remain eligible.
+   */
+  async function getExpiredFiles(
+    limit = 100,
+    { now = new Date() }: ExpiredFileQueryOptions = {},
+  ): Promise<IMongoFile[]> {
     const File = mongoose.models.File as Model<IMongoFile>;
-    return await File.find({ expiredAt: { $ne: null, $lte: now } })
+    return await File.find({
+      expiredAt: { $ne: null, $lte: now },
+      $or: [{ deletionRetryAt: null }, { deletionRetryAt: { $lte: now } }],
+    })
       .sort({ expiredAt: 1 })
       .limit(limit)
       .lean<IMongoFile[]>();
+  }
+
+  /**
+   * Records one failed sweep deletion and returns the file's resulting
+   * consecutive-failure count.
+   *
+   * The count comes back from the increment itself rather than being
+   * re-derived from the caller's snapshot. Two nodes sweeping the same file
+   * would otherwise each read the same value and each believe itself to be
+   * the same attempt, pushing the stored count past the give-up cap while
+   * both still think it is below — so the give-up would never be reported.
+   * Returning it here gives every caller a distinct attempt number.
+   */
+  async function incrementFileDeletionAttempts(file_id: string): Promise<number> {
+    const File = mongoose.models.File as Model<IMongoFile>;
+    const file = await File.findOneAndUpdate(
+      { file_id },
+      { $inc: { deletionAttempts: 1 } },
+      /** `timestamps: false`: sweep bookkeeping is not a content write.
+       *  `processCodeOutput` falls back to `updatedAt` as the writer-order
+       *  stamp for records predating `metadata.sourceDispatchedAt`, so
+       *  bumping it here would make a failed sweep look like a newer writer
+       *  and a background harvest would drop its attachment. Same reasoning
+       *  as `claimCodeFile`. */
+      { new: true, projection: { deletionAttempts: 1 }, timestamps: false },
+    ).lean<Pick<IMongoFile, 'deletionAttempts'> | null>();
+
+    return file?.deletionAttempts ?? 0;
+  }
+
+  /**
+   * Holds a file back from the sweep until `deletionRetryAt`.
+   *
+   * Written with `$max` so a deferral can only ever move later. A node that
+   * computed a shorter backoff from a lower attempt count cannot pull the
+   * file forward past a longer one another node already committed.
+   */
+  async function deferExpiredFile(file_id: string, deletionRetryAt: Date): Promise<void> {
+    const File = mongoose.models.File as Model<IMongoFile>;
+    await File.updateOne({ file_id }, { $max: { deletionRetryAt } }, { timestamps: false }).exec();
   }
 
   /**
@@ -242,7 +320,10 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
           conversationId,
           context: FileContext.execute_code,
           file_id: { $in: threadFileIds },
-          'metadata.codeEnvRef': { $exists: true },
+          $or: [
+            { 'metadata.codeEnvRef': { $exists: true } },
+            { 'metadata.codeEnvRefs': { $exists: true } },
+          ],
         },
         ownerScope,
       );
@@ -279,7 +360,10 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
         {
           file_id: { $in: fileIds },
           context: { $ne: FileContext.execute_code },
-          'metadata.codeEnvRef': { $exists: true },
+          $or: [
+            { 'metadata.codeEnvRef': { $exists: true } },
+            { 'metadata.codeEnvRefs': { $exists: true } },
+          ],
         },
         ownerScope,
       );
@@ -306,12 +390,21 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
     file_id: string;
     user: string;
     tenantId?: string | null;
+    /** The claimant's dispatch-order stamp, persisted on INSERT so a
+     *  freshly claimed (not-yet-written) row still carries an ownership
+     *  signal for the background harvest's stale-output guard. */
+    sourceDispatchedAt?: number;
   }): Promise<IMongoFile> {
     const File = mongoose.models.File as Model<IMongoFile>;
     const tenantFilter = data.tenantId ? { tenantId: data.tenantId } : { tenantId: null };
-    const insertData = data.tenantId
-      ? { file_id: data.file_id, user: data.user, tenantId: data.tenantId }
-      : { file_id: data.file_id, user: data.user };
+    const insertData = {
+      file_id: data.file_id,
+      user: data.user,
+      ...(data.tenantId ? { tenantId: data.tenantId } : {}),
+      ...(data.sourceDispatchedAt != null
+        ? { metadata: { sourceDispatchedAt: data.sourceDispatchedAt } }
+        : {}),
+    };
     const result = await File.findOneAndUpdate(
       {
         filename: data.filename,
@@ -320,7 +413,11 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
         ...tenantFilter,
       },
       { $setOnInsert: insertData },
-      { upsert: true, new: true },
+      /** `timestamps: false`: a claim is an id reservation, not a content
+       *  write — bumping `updatedAt` here would make the row look freshly
+       *  written to the background harvest's out-of-order guard, which
+       *  compares `updatedAt` against the harvest's start time. */
+      { upsert: true, new: true, timestamps: false },
     ).lean<IMongoFile>();
     if (!result) {
       throw new Error(
@@ -533,6 +630,92 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
   }
 
   /**
+   * Widens the upload-window TTL of owned, still-temporary files to
+   * `min(now + renewMs, createdAt + maxLifetimeMs)`.
+   *
+   * A renewable hold, not a release: unlike `updateFileUsage` this never
+   * unsets `expiresAt`, so a file that is held but never actually sent is
+   * still reaped once the hold lapses. Candidates are read first, then each
+   * doc gets a guarded write — no aggregation-pipeline update, which Amazon
+   * DocumentDB rejects. Four properties hold by construction, which is what
+   * makes the write safe to drive from a client-supplied id list:
+   * - capping the renewal at `createdAt + maxLifetimeMs` anchors it to an
+   *   immutable ceiling, so repeated calls converge on a fixed deadline
+   *   instead of walking a file's lifetime forward a window at a time;
+   * - renewing from `now` up to that ceiling lets a queue that is still
+   *   draining keep its attachments alive across successive runs, while an
+   *   abandoned queue lapses a single `renewMs` after its last touch rather
+   *   than surviving to the ceiling;
+   * - the `expiresAt: { $lt: next }` write guard means a hold only ever
+   *   widens, even against renewals landing between the read and the write;
+   * - `expiresAt: { $exists: true }` in the read filter and the write guard
+   *   means a file whose TTL was already cleared by a real send stays
+   *   permanent. Re-adding `expiresAt` there would schedule a live file for
+   *   deletion.
+   *
+   * `createdAt` is required rather than defaulted: without the anchor there
+   * is no ceiling to enforce, so such a file is skipped instead of held.
+   *
+   * The owner scope is required, not optional: an unscoped call would hold
+   * every user's matching file. A missing owner is a no-op, not a wide
+   * update.
+   *
+   * @param fileIds - File IDs to hold
+   * @param hold - `renewMs` granted from now, capped at `maxLifetimeMs` from upload
+   * @param owner - Owner scope; mismatches leave the TTL unchanged
+   * @returns Number of files whose hold was widened
+   */
+  async function extendFilesTTL(
+    fileIds: string[],
+    hold: { renewMs: number; maxLifetimeMs: number },
+    owner: { user: string; tenantId?: string | null },
+  ): Promise<number> {
+    const renewMs = hold?.renewMs;
+    const maxLifetimeMs = hold?.maxLifetimeMs;
+    if (fileIds.length === 0 || !owner?.user || !(renewMs > 0) || !(maxLifetimeMs > 0)) {
+      return 0;
+    }
+    const File = mongoose.models.File as Model<IMongoFile>;
+    const filter = withOwnerScope(
+      {
+        file_id: { $in: [...new Set(fileIds)] },
+        expiresAt: { $exists: true },
+        createdAt: { $exists: true },
+      },
+      { userId: owner.user, tenantId: owner.tenantId },
+    );
+    const renewUntil = Date.now() + renewMs;
+    const candidates = await File.find(filter)
+      .select({ _id: 1, expiresAt: 1, createdAt: 1 })
+      .lean<Pick<IMongoFile, '_id' | 'expiresAt' | 'createdAt'>[]>();
+    const holdOps = candidates.flatMap((file) => {
+      if (!file.createdAt || !file.expiresAt) {
+        return [];
+      }
+      const next = new Date(Math.min(renewUntil, file.createdAt.getTime() + maxLifetimeMs));
+      if (file.expiresAt.getTime() >= next.getTime()) {
+        return [];
+      }
+      return [
+        {
+          updateOne: {
+            filter: { _id: file._id, expiresAt: { $exists: true, $lt: next } },
+            update: { $set: { expiresAt: next } },
+          },
+        },
+      ];
+    });
+    if (holdOps.length === 0) {
+      return 0;
+    }
+    /** `timestamps: false`: a hold is TTL bookkeeping, not a content write.
+     *  Bumping `updatedAt` would also make every re-touch count as a
+     *  modification, hiding whether the deadline actually moved. */
+    const result = await tenantSafeBulkWrite(File, holdOps, { timestamps: false });
+    return result.modifiedCount ?? 0;
+  }
+
+  /**
    * Mark stale `status: 'pending'` file records as `'failed'` with
    * `previewError: 'orphaned'`. Recovers from the one case the
    * in-process deferred-preview render can't handle on its own: a
@@ -568,6 +751,8 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
     findFileById,
     getFiles,
     getExpiredFiles,
+    incrementFileDeletionAttempts,
+    deferExpiredFile,
     getToolFilesByIds,
     getCodeGeneratedFiles,
     getUserCodeFiles,
@@ -580,6 +765,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
     deleteFileByFilter,
     batchUpdateFiles,
     updateFilesUsage,
+    extendFilesTTL,
     sweepOrphanedPreviews,
   };
 }

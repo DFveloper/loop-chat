@@ -1,13 +1,17 @@
-import { logger } from '@librechat/data-schemas';
+import { encryptV3, logger } from '@librechat/data-schemas';
+import { CallbackManager } from '@langchain/core/callbacks/manager';
 import {
   EModelEndpoint,
   FileSources,
   MAX_SUBAGENT_DEPTH,
   MAX_SUBAGENT_RUN_CONFIGS,
 } from 'librechat-data-provider';
+import type { CompactionSemanticIndex, SubagentTaskConfig } from '@librechat/agents';
 import type { SummarizationConfig, TEndpoint } from 'librechat-data-provider';
-import type { AppConfig } from '@librechat/data-schemas';
-import { createRun } from '~/agents/run';
+import type { AppConfig, IUser } from '@librechat/data-schemas';
+import type { BaseMessage } from '@langchain/core/messages';
+import type { ModelBoundChatModelCallback } from '~/middleware/modelBoundContent';
+import { createRun, isAskUserQuestionAdminDisabled } from '~/agents/run';
 
 // Mock winston logger — `format` must be callable so @librechat/data-schemas
 // dist module-load completes cleanly; see api/test/__mocks__/logger.js.
@@ -40,14 +44,22 @@ jest.mock('winston', () => ({
   },
 }));
 
-// Mock env utilities so header resolution doesn't fail
-jest.mock('~/utils/env', () => ({
-  resolveHeaders: jest.fn((opts: { headers: unknown }) => opts?.headers ?? {}),
-  createSafeUser: jest.fn(() => ({})),
-}));
+/** Spy on the real `resolveHeaders` instead of replacing it — the templated-header
+ *  case below only proves anything if the actual substitution runs. */
+jest.mock('~/utils/env', () => {
+  const actual = jest.requireActual<typeof import('~/utils/env')>('~/utils/env');
+  return { ...actual, resolveHeaders: jest.fn(actual.resolveHeaders) };
+});
 
 jest.mock('@librechat/data-schemas', () => ({
   ...jest.requireActual('@librechat/data-schemas'),
+  decryptV3: jest.fn((value: string) => {
+    if (value === 'v3:test:sk-tenant-1') {
+      return 'sk-tenant-1';
+    }
+    throw new Error('bad decrypt');
+  }),
+  encryptV3: jest.fn((value: string) => `v3:test:${value}`),
   logger: {
     debug: jest.fn(),
     warn: jest.fn(),
@@ -74,7 +86,9 @@ jest.mock('~/agents/checkpointer', () => ({
   getAgentCheckpointer: jest.fn().mockResolvedValue({}),
 }));
 
-import { Run } from '@librechat/agents';
+import { ChatOpenAI } from '@librechat/agents/llm/openai';
+import { ChatOpenRouter } from '@librechat/agents/llm/openrouter';
+import { Run, Providers, buildChildInputs, InMemorySubagentTaskStore } from '@librechat/agents';
 
 /** Minimal RunAgent factory */
 function makeAgent(
@@ -93,9 +107,26 @@ function makeAgent(
   };
 }
 
+describe('isAskUserQuestionAdminDisabled', () => {
+  it('applies includedTools precedence and the filteredTools fallback', () => {
+    expect(isAskUserQuestionAdminDisabled(undefined)).toBe(false);
+    expect(isAskUserQuestionAdminDisabled({ includedTools: ['calculator'] } as AppConfig)).toBe(
+      true,
+    );
+    expect(
+      isAskUserQuestionAdminDisabled({ includedTools: ['ask_user_question'] } as AppConfig),
+    ).toBe(false);
+    expect(
+      isAskUserQuestionAdminDisabled({ filteredTools: ['ask_user_question'] } as AppConfig),
+    ).toBe(true);
+  });
+});
+
 type TestRunAgent = ReturnType<typeof makeAgent> & {
   subagentAgentConfigs?: TestRunAgent[];
 };
+
+type BuildChildInput = Parameters<typeof buildChildInputs>[0];
 
 function makeSubagentChain(hops: number): TestRunAgent {
   const agents = Array.from({ length: hops + 1 }, (_, index) =>
@@ -149,8 +180,16 @@ async function callAndCapture(
   opts: {
     agents?: ReturnType<typeof makeAgent>[];
     summarizationConfig?: SummarizationConfig;
+    summarizeOnly?: boolean;
     initialSummary?: { text: string; tokenCount: number };
     appConfig?: AppConfig;
+    messages?: BaseMessage[];
+    discoveredToolNames?: string[];
+    compactionSemanticIndex?: CompactionSemanticIndex;
+    subagentTasks?: SubagentTaskConfig;
+    modelCallbacks?: readonly ModelBoundChatModelCallback[];
+    user?: IUser;
+    tenantId?: string;
   } = {},
 ) {
   const agents = opts.agents ?? [makeAgent()];
@@ -160,8 +199,16 @@ async function callAndCapture(
     agents: agents as never,
     signal,
     summarizationConfig: opts.summarizationConfig,
+    summarizeOnly: opts.summarizeOnly,
     initialSummary: opts.initialSummary,
     appConfig: opts.appConfig,
+    messages: opts.messages,
+    discoveredToolNames: opts.discoveredToolNames,
+    compactionSemanticIndex: opts.compactionSemanticIndex,
+    subagentTasks: opts.subagentTasks,
+    modelCallbacks: opts.modelCallbacks,
+    user: opts.user,
+    tenantId: opts.tenantId,
     streaming: true,
     streamUsage: true,
   });
@@ -215,9 +262,96 @@ beforeEach(() => {
   delete process.env.LANGFUSE_HOST;
   delete process.env.LANGFUSE_FANOUT_ENABLED;
   delete process.env.LANGFUSE_FANOUT_COLLECTOR_URL;
-  delete process.env.LANGFUSE_FANOUT_TENANT_BASE_URL;
+  delete process.env.LANGFUSE_FANOUT_CENTRAL_MEDIA_UPLOAD_DISABLED;
   delete process.env.LANGFUSE_FANOUT_TENANT_DESTINATIONS;
   delete process.env.LANGFUSE_FANOUT_TENANT_EXPORT_DISABLED;
+  delete process.env.LANGFUSE_TRACING_ENABLED;
+  delete process.env.LANGFUSE_SAMPLE_RATE;
+  process.env.TENANT_ISOLATION_STRICT = 'true';
+});
+
+describe('compaction semantic index forwarding', () => {
+  it('forwards one host-derived snapshot to every top-level agent input', async () => {
+    const compactionSemanticIndex = [
+      {
+        type: 'activity_phase',
+        sourceMessageId: 'message-1',
+        sourceContentIndex: 3,
+        revision: 2,
+        status: 'committed',
+        text: 'Verified the release state',
+      },
+    ] satisfies CompactionSemanticIndex;
+
+    const agents = await callAndCapture({
+      agents: [makeAgent({ id: 'agent_1' }), makeAgent({ id: 'agent_2' })],
+      compactionSemanticIndex,
+    });
+
+    expect(agents).toHaveLength(2);
+    expect(agents[0].compactionSemanticIndex).toBe(compactionSemanticIndex);
+    expect(agents[1].compactionSemanticIndex).toBe(compactionSemanticIndex);
+  });
+
+  it('does not leak the parent history index into an isolated subagent', async () => {
+    const compactionSemanticIndex = [
+      {
+        type: 'activity_phase',
+        sourceMessageId: 'message-1',
+        sourceContentIndex: 3,
+        revision: 2,
+        status: 'committed',
+        text: 'Verified the release state',
+      },
+    ] satisfies CompactionSemanticIndex;
+    const child = makeAgent({ id: 'agent_child' });
+    const [root] = await callAndCapture({
+      agents: [
+        makeAgent({
+          subagents: { enabled: true, allowSelf: false, agent_ids: ['agent_child'] },
+          subagentAgentConfigs: [child],
+        }),
+      ],
+      compactionSemanticIndex,
+    });
+    const [childConfig] = root.subagentConfigs as Array<Record<string, unknown>>;
+
+    expect(root.compactionSemanticIndex).toBe(compactionSemanticIndex);
+    expect(childConfig.agentInputs).not.toHaveProperty('compactionSemanticIndex');
+  });
+});
+
+afterAll(() => {
+  delete process.env.TENANT_ISOLATION_STRICT;
+});
+
+// ---------------------------------------------------------------------------
+// Suite: agent endpoint projection
+// ---------------------------------------------------------------------------
+describe('agent endpoint projection', () => {
+  it('preserves each logical endpoint independently from its resolved provider', async () => {
+    const agents = await callAndCapture({
+      agents: [
+        makeAgent({ id: 'sales-copilot', provider: 'bedrock', endpoint: 'bedrock' }),
+        makeAgent({ id: 'dwaine', provider: 'openAI', endpoint: 'DWAINE' }),
+      ],
+    });
+
+    expect(agents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          agentId: 'sales-copilot',
+          endpoint: 'bedrock',
+          provider: 'bedrock',
+        }),
+        expect.objectContaining({
+          agentId: 'dwaine',
+          endpoint: 'DWAINE',
+          provider: 'openAI',
+        }),
+      ]),
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -250,6 +384,142 @@ describe('custom endpoint stream usage defaults', () => {
 
     expect(clientOptions.streamUsage).toBe(true);
     expect(clientOptions.usage).toBe(true);
+  });
+});
+
+describe('model-level callbacks', () => {
+  it('propagates guards through root, fallback, summary, eager, lazy, and graph clients', async () => {
+    const modelCallback: ModelBoundChatModelCallback = {
+      name: 'librechat-model-bound-content-filter',
+      raiseError: true,
+      awaitHandlers: true,
+      handleChatModelStart: jest.fn(),
+    };
+    const eagerChild = makeAgent({ id: 'agent_eager', name: 'Eager child' });
+    const lazyResolve = jest
+      .fn()
+      .mockResolvedValue(makeAgent({ id: 'agent_lazy', name: 'Lazy child' }));
+    const graphMember = makeAgent({ id: 'agent_graph', name: 'Graph member' });
+    const graphDefinition = {
+      type: 'guarded_team',
+      name: 'Guarded team',
+      description: 'Exercises graph member client options',
+      agent_ids: [graphMember.id],
+      edges: [],
+      entry_agent_id: graphMember.id,
+      result_agent_id: graphMember.id,
+    };
+    const agents = await callAndCapture({
+      modelCallbacks: [modelCallback],
+      summarizationConfig: {
+        provider: 'anthropic',
+        model: 'claude-test',
+        parameters: {
+          fallbacks: [{ provider: 'openAI', clientOptions: { temperature: 0 } }],
+        } as unknown as SummarizationConfig['parameters'],
+      },
+      agents: [
+        makeAgent({
+          model_parameters: {
+            model: 'gpt-4o',
+            fallbacks: [{ provider: 'anthropic', clientOptions: { temperature: 0 } }],
+          },
+          subagents: {
+            enabled: true,
+            allowSelf: false,
+            agent_ids: [eagerChild.id, 'agent_lazy'],
+            graphs: [graphDefinition],
+          },
+          subagentAgentConfigs: [eagerChild],
+          lazySubagentConfigs: [
+            {
+              id: 'agent_lazy',
+              name: 'Lazy child',
+              description: 'Resolves only when selected',
+              configId: 'agent_lazy:1:fingerprint',
+              resolve: lazyResolve,
+            },
+          ],
+          subagentGraphConfigs: [{ definition: graphDefinition, memberConfigs: [graphMember] }],
+        }),
+      ],
+    });
+
+    const root = agents[0];
+    const rootOptions = root.clientOptions as Record<string, unknown>;
+    expect(rootOptions.callbacks).toEqual([modelCallback]);
+    expect(
+      (
+        (rootOptions.fallbacks as Array<Record<string, unknown>>)[0].clientOptions as Record<
+          string,
+          unknown
+        >
+      ).callbacks,
+    ).toEqual([modelCallback]);
+
+    const summary = root.summarizationConfig as Record<string, unknown>;
+    const summaryParameters = summary.parameters as Record<string, unknown>;
+    expect(summaryParameters.callbacks).toEqual([modelCallback]);
+    expect(
+      (
+        (summaryParameters.fallbacks as Array<Record<string, unknown>>)[0].clientOptions as Record<
+          string,
+          unknown
+        >
+      ).callbacks,
+    ).toEqual([modelCallback]);
+
+    const configs = root.subagentConfigs as Array<Record<string, unknown>>;
+    const eager = configs.find((config) => config.type === 'agent_eager');
+    expect(
+      ((eager?.agentInputs as Record<string, unknown>).clientOptions as Record<string, unknown>)
+        .callbacks,
+    ).toEqual([modelCallback]);
+
+    const lazy = configs.find((config) => config.type === 'agent_lazy');
+    const lazyInputs = await (
+      lazy?.resolveAgentInputs as (context: never) => Promise<Record<string, unknown>>
+    )({ signal: new AbortController().signal } as never);
+    expect((lazyInputs.clientOptions as Record<string, unknown>).callbacks).toEqual([
+      modelCallback,
+    ]);
+
+    const graph = configs.find((config) => config.type === 'guarded_team');
+    const [member] = graph?.agents as Array<Record<string, unknown>>;
+    expect((member.clientOptions as Record<string, unknown>).callbacks).toEqual([modelCallback]);
+  });
+
+  it('preserves a pre-existing callback manager when installing model guards', async () => {
+    const existingLLMStart = jest.fn();
+    const existingManager = CallbackManager.fromHandlers({ handleLLMStart: existingLLMStart });
+    const modelCallback: ModelBoundChatModelCallback = {
+      name: 'librechat-model-bound-content-filter',
+      raiseError: true,
+      awaitHandlers: true,
+      handleChatModelStart: jest.fn(),
+    };
+    const agents = await callAndCapture({
+      modelCallbacks: [modelCallback],
+      agents: [
+        makeAgent({
+          model_parameters: {
+            model: 'gpt-4o',
+            callbacks: existingManager,
+          },
+        }),
+      ],
+    });
+
+    const callbacks = (agents[0].clientOptions as { callbacks: CallbackManager }).callbacks;
+    expect(callbacks).toBeInstanceOf(CallbackManager);
+    expect(callbacks).not.toBe(existingManager);
+    expect(callbacks.handlers).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ handleLLMStart: existingLLMStart }),
+        modelCallback,
+      ]),
+    );
+    expect(existingManager.handlers).toHaveLength(1);
   });
 });
 
@@ -380,6 +650,35 @@ describe('summarizationEnabled resolution', () => {
     expect(config.provider).toBe('openAI');
     expect(config.model).toBe('gpt-4o');
   });
+
+  it('false when the effective context budget is below the viable minimum', async () => {
+    /**
+     * A tiny user-set maxContextTokens re-triggers summarization on every
+     * graph step until the recursion limit aborts the run; the guard falls
+     * back to plain pruning instead.
+     */
+    const agents = await callAndCapture({
+      agents: [makeAgent({ maxContextTokens: 10 })],
+      summarizationConfig: {
+        enabled: true,
+        provider: 'anthropic',
+        model: 'claude-3-haiku',
+      },
+    });
+    expect(agents[0].summarizationEnabled).toBe(false);
+  });
+
+  it('true at exactly the 1024-token viable minimum', async () => {
+    const agents = await callAndCapture({
+      agents: [makeAgent({ maxContextTokens: 1024 })],
+      summarizationConfig: {
+        enabled: true,
+        provider: 'anthropic',
+        model: 'claude-3-haiku',
+      },
+    });
+    expect(agents[0].summarizationEnabled).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -456,9 +755,244 @@ describe('summarizationConfig field passthrough', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Suite: reasoning effort translation
+// ---------------------------------------------------------------------------
+const OPENROUTER_MODEL = 'openai/gpt-5.6';
+const ADAPTIVE_CLAUDE_MODEL = 'anthropic/claude-sonnet-4.6';
+
+/** Agent whose resolved client options already carry a reasoning configuration. */
+function makeReasoningAgent(overrides: {
+  provider: string;
+  endpoint: string;
+  model: string;
+  model_parameters: Record<string, unknown>;
+}) {
+  return makeAgent({
+    provider: overrides.provider as never,
+    endpoint: overrides.endpoint,
+    model: overrides.model,
+    model_parameters: overrides.model_parameters as never,
+  });
+}
+
+describe('summarization reasoning effort', () => {
+  it.each(['medium', 'low'])(
+    'overrides an inherited OpenRouter reasoning object with %s, leaving the agent untouched',
+    async (reasoningEffort) => {
+      const agents = await callAndCapture({
+        agents: [
+          makeReasoningAgent({
+            provider: Providers.OPENROUTER,
+            endpoint: 'OpenRouter',
+            model: OPENROUTER_MODEL,
+            model_parameters: {
+              model: OPENROUTER_MODEL,
+              modelKwargs: { reasoning: { effort: 'max' } },
+            },
+          }),
+        ],
+        summarizationConfig: {
+          provider: 'OpenRouter',
+          model: OPENROUTER_MODEL,
+          parameters: { reasoning_effort: reasoningEffort },
+        },
+      });
+
+      const mainClientOptions = agents[0].clientOptions as Record<string, unknown>;
+      const summaryConfig = agents[0].summarizationConfig as Record<string, unknown>;
+
+      expect(mainClientOptions.modelKwargs).toEqual({ reasoning: { effort: 'max' } });
+      expect(summaryConfig.parameters).toEqual({ reasoning: { effort: reasoningEffort } });
+
+      /** The SDK spreads `parameters` onto the agent's own client options. */
+      const summaryModel = new ChatOpenRouter({
+        ...mainClientOptions,
+        ...(summaryConfig.parameters as Record<string, unknown>),
+        apiKey: 'test-key',
+        model: summaryConfig.model as string,
+      });
+      const request = summaryModel.invocationParams();
+
+      expect(request.reasoning).toEqual({ effort: reasoningEffort });
+      expect(request.reasoning_effort).toBeUndefined();
+    },
+  );
+
+  it('overrides an inherited OpenAI reasoning object', async () => {
+    const agents = await callAndCapture({
+      agents: [
+        makeReasoningAgent({
+          provider: EModelEndpoint.openAI,
+          endpoint: EModelEndpoint.openAI,
+          model: 'gpt-5.6',
+          model_parameters: { model: 'gpt-5.6', reasoning: { effort: 'high' } },
+        }),
+      ],
+      summarizationConfig: {
+        provider: EModelEndpoint.openAI,
+        model: 'gpt-5.6',
+        parameters: { reasoning_effort: 'low' },
+      },
+    });
+
+    const mainClientOptions = agents[0].clientOptions as Record<string, unknown>;
+    const summaryConfig = agents[0].summarizationConfig as Record<string, unknown>;
+
+    expect(mainClientOptions.reasoning).toEqual({ effort: 'high' });
+    expect(summaryConfig.parameters).toEqual({ reasoning: { effort: 'low' } });
+
+    const summaryModel = new ChatOpenAI({
+      ...mainClientOptions,
+      ...(summaryConfig.parameters as Record<string, unknown>),
+      apiKey: 'test-key',
+      model: summaryConfig.model as string,
+    } as never);
+    const request = summaryModel.invocationParams() as Record<string, unknown>;
+
+    /** Chat Completions re-emits the object as the scalar the API expects. */
+    expect(request.reasoning_effort).toBe('low');
+  });
+
+  it('maps effort to verbosity for OpenRouter adaptive Anthropic models', async () => {
+    const agents = await callAndCapture({
+      agents: [
+        makeReasoningAgent({
+          provider: Providers.OPENROUTER,
+          endpoint: 'OpenRouter',
+          model: ADAPTIVE_CLAUDE_MODEL,
+          model_parameters: {
+            model: ADAPTIVE_CLAUDE_MODEL,
+            verbosity: 'max',
+            modelKwargs: { reasoning: { enabled: true } },
+          },
+        }),
+      ],
+      summarizationConfig: {
+        provider: 'OpenRouter',
+        model: ADAPTIVE_CLAUDE_MODEL,
+        parameters: { reasoning_effort: 'low' },
+      },
+    });
+
+    const summaryConfig = agents[0].summarizationConfig as Record<string, unknown>;
+    expect(summaryConfig.parameters).toEqual({
+      verbosity: 'low',
+      reasoning: { enabled: true },
+    });
+  });
+
+  it('turns adaptive thinking off for reasoning_effort "none"', async () => {
+    const agents = await callAndCapture({
+      agents: [
+        makeReasoningAgent({
+          provider: Providers.OPENROUTER,
+          endpoint: 'OpenRouter',
+          model: ADAPTIVE_CLAUDE_MODEL,
+          model_parameters: {
+            model: ADAPTIVE_CLAUDE_MODEL,
+            modelKwargs: { reasoning: { enabled: true } },
+          },
+        }),
+      ],
+      summarizationConfig: {
+        provider: 'OpenRouter',
+        model: ADAPTIVE_CLAUDE_MODEL,
+        parameters: { reasoning_effort: 'none' },
+      },
+    });
+
+    const summaryConfig = agents[0].summarizationConfig as Record<string, unknown>;
+    expect(summaryConfig.parameters).toEqual({ reasoning: { enabled: false } });
+
+    const summaryModel = new ChatOpenRouter({
+      ...(agents[0].clientOptions as Record<string, unknown>),
+      ...(summaryConfig.parameters as Record<string, unknown>),
+      apiKey: 'test-key',
+      model: ADAPTIVE_CLAUDE_MODEL,
+    });
+    expect(summaryModel.invocationParams().reasoning).toEqual({ enabled: false });
+  });
+
+  it('translates for a custom endpoint that resolves to OpenRouter by baseURL', async () => {
+    const appConfig = makeAppConfig([
+      { name: 'Router', baseURL: 'https://openrouter.ai/api/v1', apiKey: 'router-key' },
+    ]);
+    const agents = await callAndCapture({
+      summarizationConfig: {
+        provider: 'Router',
+        model: OPENROUTER_MODEL,
+        parameters: { reasoning_effort: 'low' },
+      },
+      appConfig,
+    });
+
+    const summaryConfig = agents[0].summarizationConfig as Record<string, unknown>;
+    expect(summaryConfig.provider).toBe(Providers.OPENROUTER);
+    expect(summaryConfig.parameters).toMatchObject({ reasoning: { effort: 'low' } });
+    expect(summaryConfig.parameters).not.toHaveProperty('reasoning_effort');
+  });
+
+  it('leaves parameters untouched for providers with no reasoning_effort concept', async () => {
+    const agents = await callAndCapture({
+      summarizationConfig: {
+        provider: EModelEndpoint.anthropic,
+        model: 'claude-3-haiku',
+        parameters: { reasoning_effort: 'low' },
+      },
+    });
+
+    const summaryConfig = agents[0].summarizationConfig as Record<string, unknown>;
+    expect(summaryConfig.parameters).toEqual({ reasoning_effort: 'low' });
+  });
+
+  it('leaves unrelated parameters and an unset effort untouched', async () => {
+    const agents = await callAndCapture({
+      agents: [
+        makeReasoningAgent({
+          provider: Providers.OPENROUTER,
+          endpoint: 'OpenRouter',
+          model: OPENROUTER_MODEL,
+          model_parameters: { model: OPENROUTER_MODEL },
+        }),
+      ],
+      summarizationConfig: {
+        provider: 'OpenRouter',
+        model: OPENROUTER_MODEL,
+        parameters: { temperature: 0.2, streaming: false, reasoning_effort: '' },
+      },
+    });
+
+    const summaryConfig = agents[0].summarizationConfig as Record<string, unknown>;
+    expect(summaryConfig.parameters).toEqual({
+      temperature: 0.2,
+      streaming: false,
+      reasoning_effort: '',
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Suite 5: Multi-agent + per-agent overrides
 // ---------------------------------------------------------------------------
 describe('multi-agent + per-agent overrides', () => {
+  it('normalizes missing persisted edges before creating the SDK graph', async () => {
+    await createRun({
+      agents: [makeAgent({ id: 'agent_1' }), makeAgent({ id: 'agent_2' })] as never,
+      signal: new AbortController().signal,
+      streaming: true,
+      streamUsage: true,
+    });
+
+    const createMock = Run.create as jest.Mock;
+    const runConfig = createMock.mock.calls[0][0] as {
+      graphConfig: { type: string; edges: unknown[] };
+    };
+    expect(runConfig.graphConfig).toMatchObject({
+      type: 'multi-agent',
+      edges: [],
+    });
+  });
+
   it('different agents get different effectiveMaxContextTokens', async () => {
     const agents = await callAndCapture({
       agents: [
@@ -774,6 +1308,29 @@ describe('custom-endpoint provider resolution', () => {
     expect(call).toBeDefined();
   });
 
+  it('uses the authoritative run tenant in custom-endpoint summarization headers', async () => {
+    const appConfig = makeAppConfig([
+      {
+        name: 'Tenant Gateway',
+        baseURL: 'https://gateway.example.com/v1',
+        apiKey: 'gateway-key',
+        headers: { 'X-Tenant-ID': '{{LIBRECHAT_USER_TENANT_ID}}' },
+      },
+    ]);
+    const agents = await callAndCapture({
+      summarizationConfig: { provider: 'Tenant Gateway', model: 'summary-model' },
+      appConfig,
+      user: { id: 'user-1', tenantId: 'stale-user-tenant' } as IUser,
+      tenantId: 'request-tenant',
+    });
+
+    const config = agents[0].summarizationConfig as Record<string, unknown>;
+    const parameters = config.parameters as Record<string, unknown>;
+    const configuration = parameters.configuration as Record<string, unknown>;
+
+    expect(configuration.defaultHeaders).toEqual({ 'X-Tenant-ID': 'request-tenant' });
+  });
+
   it('forwards PROXY env var into summarization client configuration', async () => {
     const originalProxy = process.env.PROXY;
     process.env.PROXY = 'http://proxy.internal:3128';
@@ -964,12 +1521,172 @@ describe('custom-endpoint provider resolution', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Suite: built-in provider request shaping (#15598)
+// ---------------------------------------------------------------------------
+/**
+ * A built-in provider produces no custom-endpoint config, so `getOpenAIConfig`
+ * was skipped entirely and the summarizer learned neither which API its model
+ * takes nor whether its endpoint is first-party. The agents SDK defaults its
+ * model-specific constraints off without that declaration, so configured
+ * parameters reached the model unshaped.
+ *
+ * These assert the declaration LibreChat emits, which is the half it owns; the
+ * SDK's honoring of it is covered by its own tests.
+ */
+describe('built-in provider request shaping', () => {
+  const anthropicAgent = () =>
+    makeAgent({
+      provider: 'anthropic',
+      endpoint: 'anthropic',
+      model: 'claude-sonnet-4.6',
+      model_parameters: { model: 'claude-sonnet-4.6' },
+    });
+
+  const summarizeWith = async (
+    parameters?: Record<string, unknown>,
+    model = 'gpt-6-astra',
+  ): Promise<Record<string, unknown>> => {
+    const agents = await callAndCapture({
+      agents: [anthropicAgent()],
+      appConfig: makeAppConfig([]),
+      summarizationConfig: {
+        provider: 'openAI',
+        model,
+        parameters: parameters as SummarizationConfig['parameters'],
+      },
+    });
+    const config = agents[0].summarizationConfig as Record<string, unknown>;
+    return config.parameters as Record<string, unknown>;
+  };
+
+  it('declares the first-party endpoint for a cross-provider built-in summarizer', async () => {
+    expect(await summarizeWith(undefined, 'gpt-4o')).toMatchObject({ firstPartyEndpoint: true });
+  });
+
+  it('routes a Responses-only model to the Responses API', async () => {
+    expect(await summarizeWith()).toMatchObject({
+      firstPartyEndpoint: true,
+      useResponsesApi: true,
+    });
+  });
+
+  it('keeps the declaration alongside a translated reasoning effort', async () => {
+    /**
+     * The reachable failure from #15598: `resolveReasoningParams` translates the
+     * scalar effort for the summarizer, and without the declaration an effort
+     * the model rejects reached it verbatim.
+     */
+    expect(await summarizeWith({ reasoning_effort: 'minimal' })).toMatchObject({
+      firstPartyEndpoint: true,
+      reasoning: { effort: 'minimal' },
+    });
+  });
+
+  it('does not claim a first-party endpoint behind a user configuration.baseURL', async () => {
+    expect(
+      await summarizeWith({ configuration: { baseURL: 'https://gateway.internal/v1' } }),
+    ).toEqual({ configuration: { baseURL: 'https://gateway.internal/v1' } });
+  });
+
+  it('does not claim a first-party endpoint behind a user baseURL', async () => {
+    expect(await summarizeWith({ baseURL: 'https://gateway.internal/v1' })).toEqual({
+      baseURL: 'https://gateway.internal/v1',
+    });
+  });
+
+  it('leaves credentials and transport to the client', async () => {
+    const parameters = await summarizeWith();
+    expect(parameters.apiKey).toBeUndefined();
+    expect(parameters.model).toBeUndefined();
+    expect(parameters.modelName).toBeUndefined();
+    expect(parameters.streaming).toBeUndefined();
+    expect(parameters.configuration).toBeUndefined();
+  });
+
+  it('leaves a same-endpoint summarizer on the agent client options', async () => {
+    const agents = await callAndCapture({
+      appConfig: makeAppConfig([]),
+      summarizationConfig: { provider: 'openAI', model: 'gpt-6-astra' },
+    });
+    const config = agents[0].summarizationConfig as Record<string, unknown>;
+    expect(config.parameters).toBeUndefined();
+  });
+
+  it('routes a reasoning model the way the agent flow would', async () => {
+    /** `getOpenAIConfig` reads the effort from modelOptions, not from the merged
+     * parameters, so it has to be handed the summarizer's own effort. */
+    expect(await summarizeWith({ reasoning_effort: 'medium' }, 'gpt-5.6')).toMatchObject({
+      firstPartyEndpoint: true,
+      useResponsesApi: true,
+      reasoning: { effort: 'medium' },
+    });
+  });
+
+  it('withholds the declaration when a reverse proxy serves the built-in endpoint', async () => {
+    process.env.OPENAI_REVERSE_PROXY = 'https://gateway.internal/v1';
+    try {
+      expect(await summarizeWith()).toBeUndefined();
+    } finally {
+      delete process.env.OPENAI_REVERSE_PROXY;
+    }
+  });
+
+  it('withholds the declaration when the base URL is user-provided', async () => {
+    process.env.OPENAI_REVERSE_PROXY = 'user_provided';
+    try {
+      expect(await summarizeWith()).toBeUndefined();
+    } finally {
+      delete process.env.OPENAI_REVERSE_PROXY;
+    }
+  });
+
+  it('declares nothing for an agent whose custom endpoint normalized to openAI', async () => {
+    /**
+     * `initializeAgent` rewrites a custom-endpoint agent's provider to `openAI`
+     * while its endpoint keeps the custom name. With summarization omitted, the
+     * summarizer reuses that agent's client — which points at the gateway, not
+     * at OpenAI.
+     */
+    const agents = await callAndCapture({
+      agents: [
+        makeAgent({
+          provider: 'openAI',
+          endpoint: 'MyGateway',
+          model: 'gpt-6-astra',
+          model_parameters: { model: 'gpt-6-astra' },
+        }),
+      ],
+      appConfig: makeAppConfig([
+        { name: 'MyGateway', baseURL: 'https://gateway.internal/v1', apiKey: 'gw-key' },
+      ]),
+      summarizationConfig: { model: 'gpt-6-astra' },
+    });
+    const config = agents[0].summarizationConfig as Record<string, unknown>;
+    expect(config.parameters).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Suite 8: subagentConfigs
 // ---------------------------------------------------------------------------
 describe('subagentConfigs', () => {
   it('is undefined when subagents are not enabled', async () => {
     const agents = await callAndCapture({});
     expect(agents[0].subagentConfigs).toBeUndefined();
+  });
+
+  it('keeps the poll tool available for existing tasks after spawning is disabled', async () => {
+    const agents = await callAndCapture({
+      subagentTasks: {
+        store: new InMemorySubagentTaskStore(),
+        scopeId: 'existing-task-scope',
+      },
+    });
+
+    expect(agents[0].subagentConfigs).toBeUndefined();
+    expect(agents[0].toolDefinitions).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: 'check_background_task' })]),
+    );
   });
 
   it('adds self-spawn when enabled and allowSelf defaults to true', async () => {
@@ -1012,6 +1729,600 @@ describe('subagentConfigs', () => {
     });
     expect(configs[0].agentInputs).toBeDefined();
     expect(configs[0].self).toBeUndefined();
+  });
+
+  it('adds explicit lazy subagent descriptors without eager agent inputs', async () => {
+    const resolve = jest
+      .fn()
+      .mockResolvedValue(
+        makeAgent({ id: 'agent_child', name: 'Researcher', description: 'Deep web research' }),
+      );
+    const agents = await callAndCapture({
+      agents: [
+        makeAgent({
+          subagents: { enabled: true, allowSelf: false, agent_ids: ['agent_child'] },
+          lazySubagentConfigs: [
+            {
+              id: 'agent_child',
+              name: 'Researcher',
+              description: 'Deep web research',
+              configId: 'agent_child:3:fingerprint',
+              resolve,
+            },
+          ],
+        }),
+      ],
+    });
+    const configs = agents[0].subagentConfigs as Array<Record<string, unknown>>;
+    expect(configs).toHaveLength(1);
+    expect(configs[0]).toMatchObject({
+      type: 'agent_child',
+      configId: 'agent_child:3:fingerprint',
+      allowNested: true,
+    });
+    expect(configs[0].agentInputs).toBeUndefined();
+    expect(configs[0].resolveAgentInputs).toBeInstanceOf(Function);
+    expect(resolve).not.toHaveBeenCalled();
+
+    const childInputs = await (
+      configs[0].resolveAgentInputs as (context: never) => Promise<{
+        name?: string;
+      }>
+    )({ signal: new AbortController().signal } as never);
+    expect(resolve).toHaveBeenCalledTimes(1);
+    expect(childInputs.name).toBe('Researcher');
+  });
+
+  it.each([
+    ['foreground', undefined],
+    [
+      'detached',
+      {
+        store: new InMemorySubagentTaskStore(),
+        scopeId: 'file-context-task-scope',
+      } satisfies SubagentTaskConfig,
+    ],
+  ])("preserves a lazy child's prepared File Context in %s execution", async (_mode, tasks) => {
+    const fileContext = 'Attached document(s):\n```md\n# "child.txt"\nChild-only facts\n\n```';
+    const resolve = jest.fn().mockResolvedValue(
+      makeAgent({
+        id: 'agent_child',
+        name: 'Researcher',
+        additional_instructions: fileContext,
+      }),
+    );
+    const agents = await callAndCapture({
+      subagentTasks: tasks,
+      agents: [
+        makeAgent({
+          subagents: { enabled: true, allowSelf: false, agent_ids: ['agent_child'] },
+          lazySubagentConfigs: [
+            {
+              id: 'agent_child',
+              name: 'Researcher',
+              description: 'Uses private File Context',
+              configId: 'agent_child:3:fingerprint',
+              resolve,
+            },
+          ],
+        }),
+      ],
+    });
+    const [config] = agents[0].subagentConfigs as Array<Record<string, unknown>>;
+    const childInputs = await (
+      config.resolveAgentInputs as (context: never) => Promise<Record<string, unknown>>
+    )({ signal: new AbortController().signal } as never);
+
+    expect(childInputs.additional_instructions).toBe(fileContext);
+  });
+
+  it('preserves prepared File Context for an eager legacy subagent', async () => {
+    const fileContext = 'Attached document(s):\n```md\n# "child.txt"\nLegacy child facts\n\n```';
+    const child = makeAgent({
+      id: 'agent_child',
+      name: 'Researcher',
+      additional_instructions: fileContext,
+    });
+    const agents = await callAndCapture({
+      agents: [
+        makeAgent({
+          subagents: { enabled: true, allowSelf: false, agent_ids: ['agent_child'] },
+          subagentAgentConfigs: [child],
+        }),
+      ],
+    });
+    const [config] = agents[0].subagentConfigs as Array<Record<string, unknown>>;
+    const childInputs = config.agentInputs as Record<string, unknown>;
+
+    expect(childInputs.additional_instructions).toBe(fileContext);
+  });
+
+  it('uses a fresh expansion budget for each lazy descriptor resolution', async () => {
+    const nestedDescriptors = Array.from({ length: 99 }, (_, index) => ({
+      id: `agent_nested_${index}`,
+      name: `Nested ${index}`,
+      description: 'Nested lazy child',
+      configId: `agent_nested_${index}:1:fingerprint`,
+      resolve: jest.fn(),
+    }));
+    const resolve = jest.fn().mockResolvedValue(
+      makeAgent({
+        id: 'agent_child',
+        subagents: { enabled: true, allowSelf: false },
+        lazySubagentConfigs: nestedDescriptors,
+      }),
+    );
+    const agents = await callAndCapture({
+      agents: [
+        makeAgent({
+          subagents: { enabled: true, allowSelf: false, agent_ids: ['agent_child'] },
+          lazySubagentConfigs: [
+            {
+              id: 'agent_child',
+              name: 'Child',
+              description: 'Lazy child',
+              configId: 'agent_child:1:fingerprint',
+              resolve,
+            },
+          ],
+        }),
+      ],
+    });
+    const resolveAgentInputs = (agents[0].subagentConfigs as Array<Record<string, unknown>>)[0]
+      .resolveAgentInputs as (context: never) => Promise<unknown>;
+    const context = { signal: new AbortController().signal } as never;
+
+    await expect(resolveAgentInputs(context)).resolves.toBeDefined();
+    await expect(resolveAgentInputs(context)).resolves.toBeDefined();
+    expect(resolve).toHaveBeenCalledTimes(2);
+  });
+
+  it('uses pristine top-level inputs for a graph resolved by a lazy child', async () => {
+    const topLevelMember = makeAgent({
+      id: 'agent_top_level_member',
+      hasDeferredTools: true,
+      toolDefinitions: [{ name: 'tool_search' }],
+      toolRegistry: new Map([['deep_tool', { name: 'deep_tool', defer_loading: true }]]),
+    });
+    const definition = {
+      type: 'late_team',
+      name: 'Late team',
+      description: 'Resolves after the parent input is built',
+      agent_ids: [topLevelMember.id],
+      edges: [],
+      entry_agent_id: topLevelMember.id,
+      result_agent_id: topLevelMember.id,
+    };
+    const resolve = jest.fn().mockResolvedValue(
+      makeAgent({
+        id: 'agent_lazy_parent',
+        subagents: { enabled: true, allowSelf: false, graphs: [definition] },
+        subagentGraphConfigs: [{ definition, memberConfigs: [topLevelMember] }],
+      }),
+    );
+    const parent = makeAgent({
+      id: 'agent_parent',
+      subagents: { enabled: true, allowSelf: false, agent_ids: ['agent_lazy_parent'] },
+      lazySubagentConfigs: [
+        {
+          id: 'agent_lazy_parent',
+          name: 'Lazy parent',
+          description: 'Lazy graph owner',
+          configId: 'agent_lazy_parent:1:fingerprint',
+          resolve,
+        },
+      ],
+    });
+
+    const agents = await callAndCapture({
+      agents: [topLevelMember, parent],
+      messages: [],
+      discoveredToolNames: ['deep_tool'],
+    });
+    const lazyConfig = (agents[1].subagentConfigs as Array<Record<string, unknown>>)[0];
+    const resolvedInputs = await (
+      lazyConfig.resolveAgentInputs as (context: never) => Promise<Record<string, unknown>>
+    )({ signal: new AbortController().signal } as never);
+    const graphConfig = (resolvedInputs.subagentConfigs as Array<Record<string, unknown>>)[0];
+    const memberInput = (graphConfig.agents as Array<Record<string, unknown>>)[0];
+    const memberRegistry = memberInput.toolRegistry as Map<string, { defer_loading?: boolean }>;
+
+    expect(
+      (agents[0].toolRegistry as Map<string, { defer_loading?: boolean }>).get('deep_tool'),
+    ).toMatchObject({ defer_loading: false });
+    expect(memberRegistry.get('deep_tool')).toMatchObject({ defer_loading: true });
+    expect(memberInput.toolDefinitions).toEqual([{ name: 'tool_search' }]);
+  });
+
+  it('builds lazy graph inputs from initialized members instead of capability metadata', async () => {
+    const childId = 'agent_lazy_capability_parent';
+    const memberId = 'agent_lazy_capability_member';
+    const metadata = makeAgent({ id: memberId, codeEnvAvailable: true });
+    const initializedMember = makeAgent({
+      id: memberId,
+      codeEnvAvailable: true,
+      toolDefinitions: [{ name: 'initialized_tool' }],
+      toolRegistry: new Map([['initialized_tool', { name: 'initialized_tool' }]]),
+    });
+    const definition = {
+      type: 'capability_team',
+      name: 'Capability team',
+      description: 'Uses the initialized member runtime',
+      agent_ids: [childId, memberId],
+      edges: [{ from: childId, to: memberId, edgeType: 'direct' as const }],
+      entry_agent_id: childId,
+      result_agent_id: memberId,
+    };
+    const resolve = jest.fn().mockImplementation(async () => {
+      const initializedChild = makeAgent({
+        id: childId,
+        toolDefinitions: [{ name: 'child_tool' }],
+        toolRegistry: new Map([['child_tool', { name: 'child_tool' }]]),
+        subagents: { enabled: true, allowSelf: false, graphs: [definition] },
+      });
+      initializedChild.subagentGraphConfigs = [
+        { definition, memberConfigs: [initializedChild, initializedMember] },
+      ];
+      return initializedChild;
+    });
+    const agents = await callAndCapture({
+      agents: [
+        makeAgent({
+          id: 'agent_parent',
+          subagents: {
+            enabled: true,
+            allowSelf: false,
+            agent_ids: [childId],
+          },
+          lazySubagentConfigs: [
+            {
+              id: childId,
+              name: 'Lazy capability parent',
+              description: 'Resolves its team on selection',
+              configId: `${childId}:1:fingerprint`,
+              subagentGraphMemberMetadata: [metadata],
+              resolve,
+            },
+          ],
+        }),
+      ],
+    });
+    const lazyConfig = (agents[0].subagentConfigs as Array<Record<string, unknown>>)[0];
+    const resolvedInputs = await (
+      lazyConfig.resolveAgentInputs as (context: never) => Promise<Record<string, unknown>>
+    )({ signal: new AbortController().signal } as never);
+    const graphConfig = (resolvedInputs.subagentConfigs as Array<Record<string, unknown>>)[0];
+    const memberInputs = graphConfig.agents as Array<Record<string, unknown>>;
+
+    expect(memberInputs[0].toolDefinitions).toEqual([{ name: 'child_tool' }]);
+    expect(memberInputs[0].toolRegistry).toEqual(new Map([['child_tool', { name: 'child_tool' }]]));
+    expect(memberInputs[1].toolDefinitions).toEqual([{ name: 'initialized_tool' }]);
+    expect(memberInputs[1].toolRegistry).toEqual(
+      new Map([['initialized_tool', { name: 'initialized_tool' }]]),
+    );
+  });
+
+  it('builds an explicit saved-agent team as one graph subagent config', async () => {
+    const researcher = makeAgent({
+      id: 'agent_researcher',
+      name: 'Researcher',
+      recursion_limit: 30,
+    });
+    const writer = makeAgent({
+      id: 'agent_writer',
+      name: 'Writer',
+      recursion_limit: 24,
+      subagents: { enabled: true, agent_ids: ['agent_nested'] },
+      subagentAgentConfigs: [makeAgent({ id: 'agent_nested' })],
+    });
+    const definition = {
+      type: 'research_team',
+      name: 'Research team',
+      description: 'Researches and writes a final answer',
+      agent_ids: ['agent_researcher', 'agent_writer'],
+      edges: [{ from: 'agent_researcher', to: 'agent_writer', edgeType: 'direct' as const }],
+      entry_agent_id: 'agent_researcher',
+      result_agent_id: 'agent_writer',
+    };
+    const agents = await callAndCapture({
+      agents: [
+        makeAgent({
+          subagents: { enabled: true, allowSelf: false, graphs: [definition] },
+          subagentGraphConfigs: [{ definition, memberConfigs: [researcher, writer] }],
+        }),
+      ],
+    });
+
+    const configs = agents[0].subagentConfigs as Array<Record<string, unknown>>;
+    expect(configs).toHaveLength(1);
+    expect(configs[0]).toMatchObject({
+      kind: 'graph',
+      type: 'research_team',
+      name: 'Research team',
+      description: 'Researches and writes a final answer',
+      edges: definition.edges,
+      entryAgentId: 'agent_researcher',
+      resultAgentId: 'agent_writer',
+      maxTurns: 8,
+    });
+    const memberInputs = configs[0].agents as Array<Record<string, unknown>>;
+    expect(memberInputs.map((member) => member.agentId)).toEqual([
+      'agent_researcher',
+      'agent_writer',
+    ]);
+    expect(memberInputs.every((member) => member.subagentConfigs == null)).toBe(true);
+  });
+
+  it('builds a one-member graph subagent without edges', async () => {
+    const member = makeAgent({ id: 'agent_solo', name: 'Solo' });
+    const definition = {
+      type: 'solo_team',
+      name: 'Solo team',
+      description: 'Runs one isolated graph member',
+      agent_ids: ['agent_solo'],
+      edges: [],
+      entry_agent_id: 'agent_solo',
+      result_agent_id: 'agent_solo',
+    };
+    const agents = await callAndCapture({
+      agents: [
+        makeAgent({
+          subagents: { enabled: true, allowSelf: false, graphs: [definition] },
+          subagentGraphConfigs: [{ definition, memberConfigs: [member] }],
+        }),
+      ],
+    });
+
+    expect(agents[0].subagentConfigs).toEqual([
+      expect.objectContaining({
+        kind: 'graph',
+        type: 'solo_team',
+        agents: [expect.objectContaining({ agentId: 'agent_solo' })],
+        edges: [],
+        entryAgentId: 'agent_solo',
+        resultAgentId: 'agent_solo',
+      }),
+    ]);
+  });
+
+  it('normalizes an explicit false excludeResults value before SDK validation', async () => {
+    const researcher = makeAgent({ id: 'agent_researcher' });
+    const writer = makeAgent({ id: 'agent_writer' });
+    const definition = {
+      type: 'default_results_team',
+      name: 'Default results team',
+      description: 'Uses the default edge result behavior',
+      agent_ids: ['agent_researcher', 'agent_writer'],
+      edges: [
+        {
+          from: 'agent_researcher',
+          to: 'agent_writer',
+          edgeType: 'direct' as const,
+          excludeResults: false,
+        },
+      ],
+      entry_agent_id: 'agent_researcher',
+      result_agent_id: 'agent_writer',
+    };
+    const agents = await callAndCapture({
+      agents: [
+        makeAgent({
+          subagents: { enabled: true, allowSelf: false, graphs: [definition] },
+          subagentGraphConfigs: [{ definition, memberConfigs: [researcher, writer] }],
+        }),
+      ],
+    });
+
+    const [config] = agents[0].subagentConfigs as Array<Record<string, unknown>>;
+    expect(config.edges).toEqual([
+      { from: 'agent_researcher', to: 'agent_writer', edgeType: 'direct' },
+    ]);
+  });
+
+  it("adds each graph member's always-apply skills to its isolated context", async () => {
+    const member = makeAgent({
+      id: 'agent_skilled_member',
+      additional_instructions: 'Keep the response concise.',
+      alwaysApplySkillPrimes: [
+        { name: 'member-workflow', body: 'Follow the member-specific workflow.' },
+      ],
+    });
+    const definition = {
+      type: 'skilled_team',
+      name: 'Skilled team',
+      description: 'Runs a member with its own always-apply skill',
+      agent_ids: ['agent_skilled_member'],
+      edges: [],
+      entry_agent_id: 'agent_skilled_member',
+      result_agent_id: 'agent_skilled_member',
+    };
+    const agents = await callAndCapture({
+      agents: [
+        makeAgent({
+          subagents: { enabled: true, allowSelf: false, graphs: [definition] },
+          subagentGraphConfigs: [{ definition, memberConfigs: [member] }],
+        }),
+      ],
+    });
+
+    const [config] = agents[0].subagentConfigs as Array<Record<string, unknown>>;
+    const [memberInput] = config.agents as Array<Record<string, unknown>>;
+    expect(memberInput.additional_instructions).toBe(
+      'Keep the response concise.\n\n' +
+        '# Always-apply skill: member-workflow\nFollow the member-specific workflow.',
+    );
+  });
+
+  it('isolates a parent graph member before discovered tools mutate the parent registry', async () => {
+    const agent = makeAgent({
+      id: 'agent_parent',
+      name: 'Parent',
+      hasDeferredTools: true,
+      toolDefinitions: [{ name: 'tool_search' }],
+      toolRegistry: new Map([['deep_tool', { name: 'deep_tool', defer_loading: true }]]),
+    });
+    const definition = {
+      type: 'self_team',
+      name: 'Self team',
+      description: 'Runs the parent as an isolated graph member',
+      agent_ids: ['agent_parent'],
+      edges: [],
+      entry_agent_id: 'agent_parent',
+      result_agent_id: 'agent_parent',
+    };
+    agent.subagents = { enabled: true, allowSelf: false, graphs: [definition] };
+    agent.subagentGraphConfigs = [{ definition, memberConfigs: [agent] }];
+
+    const agents = await callAndCapture({
+      agents: [agent],
+      messages: [],
+      discoveredToolNames: ['deep_tool'],
+    });
+
+    const parentRegistry = agents[0].toolRegistry as Map<string, { defer_loading?: boolean }>;
+    const graphConfig = (agents[0].subagentConfigs as Array<Record<string, unknown>>)[0];
+    const memberInputs = graphConfig.agents as Array<Record<string, unknown>>;
+    const memberRegistry = memberInputs[0].toolRegistry as Map<string, { defer_loading?: boolean }>;
+    expect(parentRegistry.get('deep_tool')?.defer_loading).toBe(false);
+    expect(memberRegistry.get('deep_tool')?.defer_loading).toBe(true);
+    expect(memberInputs[0].toolDefinitions).toEqual([{ name: 'tool_search' }]);
+  });
+
+  it('snapshots graph members before an earlier top-level input mutates them', async () => {
+    const earlierAgent = makeAgent({
+      id: 'agent_earlier',
+      name: 'Earlier',
+      hasDeferredTools: true,
+      toolDefinitions: [{ name: 'tool_search' }],
+      toolRegistry: new Map([['deep_tool', { name: 'deep_tool', defer_loading: true }]]),
+    });
+    const definition = {
+      type: 'cross_root_team',
+      name: 'Cross-root team',
+      description: 'Uses an earlier top-level agent as an isolated member',
+      agent_ids: ['agent_earlier'],
+      edges: [],
+      entry_agent_id: 'agent_earlier',
+      result_agent_id: 'agent_earlier',
+    };
+    const laterAgent = makeAgent({
+      id: 'agent_later',
+      name: 'Later',
+      subagents: { enabled: true, allowSelf: false, graphs: [definition] },
+      subagentGraphConfigs: [{ definition, memberConfigs: [earlierAgent] }],
+    });
+
+    const agents = await callAndCapture({
+      agents: [earlierAgent, laterAgent],
+      messages: [],
+      discoveredToolNames: ['deep_tool'],
+    });
+
+    const earlierRegistry = agents[0].toolRegistry as Map<string, { defer_loading?: boolean }>;
+    const laterGraph = (agents[1].subagentConfigs as Array<Record<string, unknown>>)[0];
+    const memberInputs = laterGraph.agents as Array<Record<string, unknown>>;
+    const memberRegistry = memberInputs[0].toolRegistry as Map<string, { defer_loading?: boolean }>;
+    expect(earlierRegistry.get('deep_tool')?.defer_loading).toBe(false);
+    expect(memberRegistry.get('deep_tool')?.defer_loading).toBe(true);
+    expect(memberInputs[0].toolDefinitions).toEqual([{ name: 'tool_search' }]);
+  });
+
+  it('preserves explicit nested subagents across the SDK child graph boundary', async () => {
+    const grandchild = makeAgent({ id: 'agent_grandchild', name: 'Grandchild' });
+    const child = makeAgent({
+      id: 'agent_child',
+      name: 'Child',
+      subagents: { enabled: true, allowSelf: false, agent_ids: ['agent_grandchild'] },
+      subagentAgentConfigs: [grandchild],
+    });
+    const agents = await callAndCapture({
+      agents: [
+        makeAgent({
+          subagents: { enabled: true, allowSelf: false, agent_ids: ['agent_child'] },
+          subagentAgentConfigs: [child],
+        }),
+      ],
+    });
+
+    expect(agents[0].maxSubagentDepth).toBe(MAX_SUBAGENT_DEPTH);
+    const childConfig = (agents[0].subagentConfigs as BuildChildInput[])[0];
+    expect(childConfig.allowNested).toBe(true);
+
+    const childInputs = buildChildInputs(childConfig, 'agent_child', MAX_SUBAGENT_DEPTH);
+    expect(childInputs.maxSubagentDepth).toBe(MAX_SUBAGENT_DEPTH - 1);
+    expect(childInputs.subagentConfigs).toHaveLength(1);
+    expect(childInputs.subagentConfigs?.[0]).toMatchObject({
+      type: 'agent_grandchild',
+      allowNested: true,
+    });
+  });
+
+  it('prunes shared-agent cycles per traversal path without dropping valid edges', async () => {
+    const left = makeAgent({
+      id: 'agent_left',
+      name: 'Left',
+      subagents: { enabled: true, allowSelf: false, agent_ids: ['agent_shared'] },
+    }) as TestRunAgent;
+    const right = makeAgent({
+      id: 'agent_right',
+      name: 'Right',
+      subagents: { enabled: true, allowSelf: false, agent_ids: ['agent_shared'] },
+    }) as TestRunAgent;
+    const shared = makeAgent({
+      id: 'agent_shared',
+      name: 'Shared',
+      subagents: { enabled: true, allowSelf: false, agent_ids: ['agent_left'] },
+    }) as TestRunAgent;
+    left.subagentAgentConfigs = [shared];
+    right.subagentAgentConfigs = [shared];
+    shared.subagentAgentConfigs = [left];
+
+    const agents = await callAndCapture({
+      agents: [
+        makeAgent({
+          subagents: {
+            enabled: true,
+            allowSelf: false,
+            agent_ids: ['agent_left', 'agent_right'],
+          },
+          subagentAgentConfigs: [left, right],
+        }),
+      ],
+    });
+
+    const rootConfigs = agents[0].subagentConfigs as BuildChildInput[];
+    const rootConfigsByType = new Map(rootConfigs.map((config) => [config.type, config]));
+    const leftConfig = rootConfigsByType.get('agent_left');
+    const rightConfig = rootConfigsByType.get('agent_right');
+    if (!leftConfig || !rightConfig) {
+      throw new Error('Expected both root subagent configs');
+    }
+    const leftInputs = buildChildInputs(leftConfig, 'agent_left', MAX_SUBAGENT_DEPTH);
+    const rightInputs = buildChildInputs(rightConfig, 'agent_right', MAX_SUBAGENT_DEPTH);
+    const leftShared = leftInputs.subagentConfigs?.[0] as BuildChildInput | undefined;
+    const rightShared = rightInputs.subagentConfigs?.[0] as BuildChildInput | undefined;
+    if (
+      !leftShared ||
+      !rightShared ||
+      leftInputs.maxSubagentDepth == null ||
+      rightInputs.maxSubagentDepth == null
+    ) {
+      throw new Error('Expected both shared subagent configs');
+    }
+    const leftSharedInputs = buildChildInputs(
+      leftShared,
+      'agent_shared',
+      leftInputs.maxSubagentDepth,
+    );
+    const rightSharedInputs = buildChildInputs(
+      rightShared,
+      'agent_shared',
+      rightInputs.maxSubagentDepth,
+    );
+
+    expect(leftSharedInputs.subagentConfigs).toBeUndefined();
+    expect(rightSharedInputs.subagentConfigs).toHaveLength(1);
+    expect(rightSharedInputs.subagentConfigs?.[0]).toMatchObject({ type: 'agent_left' });
   });
 
   it('combines self-spawn and explicit subagents when both enabled', async () => {
@@ -1156,10 +2467,19 @@ async function callAndCaptureRunConfig({
 // ---------------------------------------------------------------------------
 // Suite: Langfuse run config
 // ---------------------------------------------------------------------------
+const exportTelemetry = (plan: string, reason: string, tenantId?: string) => ({
+  ...(tenantId ? { 'librechat.tenant.id': tenantId } : {}),
+  'librechat.langfuse.export_plan': plan,
+  'librechat.langfuse.export_reason': reason,
+});
+
 describe('Langfuse run config', () => {
   it('passes deterministic Langfuse trace config without tenant metadata by default', async () => {
     const callArgs = await callAndCaptureRunConfig();
-    expect(callArgs.langfuse).toEqual({ deterministicTraceId: true });
+    expect(callArgs.langfuse).toEqual({
+      deterministicTraceId: true,
+      librechatTraceAttributes: exportTelemetry('central_only', 'fanout_disabled'),
+    });
   });
 
   it('adds the explicit request tenant id to Langfuse trace metadata and tags', async () => {
@@ -1171,6 +2491,7 @@ describe('Langfuse run config', () => {
     });
     expect(callArgs.langfuse).toEqual({
       deterministicTraceId: true,
+      librechatTraceAttributes: exportTelemetry('central_only', 'fanout_disabled', 'tenant-1'),
       metadata: { 'librechat.tenant.id': 'tenant-1' },
       tags: ['tenant:tenant-1'],
     });
@@ -1184,23 +2505,63 @@ describe('Langfuse run config', () => {
     });
     expect(callArgs.langfuse).toEqual({
       deterministicTraceId: true,
+      librechatTraceAttributes: exportTelemetry('central_only', 'fanout_disabled', 'tenant-2'),
       metadata: { 'librechat.tenant.id': 'tenant-2' },
       tags: ['tenant:tenant-2'],
     });
   });
 
+  it('forwards the requesting user and trace context into the Langfuse run config', async () => {
+    await createRun({
+      agents: [makeAgent()] as never,
+      signal: new AbortController().signal,
+      streaming: true,
+      streamUsage: true,
+      user: { id: 'user-1', email: 'alice@example.com', role: 'ADMIN' } as never,
+      conversationId: 'convo-1',
+      requestBody: { conversationId: 'convo-stale' },
+      traceContext: { endpoint: 'agents', spec: 'support-bot' },
+      appConfig: {
+        langfuse: {
+          trace: {
+            userIdField: 'email',
+            userMetadataFields: ['role'],
+            conversationMetadataFields: ['conversationId', 'endpoint', 'provider', 'model', 'spec'],
+          },
+        },
+      } as unknown as AppConfig,
+    });
+
+    const createMock = Run.create as jest.Mock;
+    expect(createMock).toHaveBeenCalledTimes(1);
+    const callArgs = createMock.mock.calls[0][0] as Record<string, unknown>;
+    expect(callArgs.langfuse).toEqual({
+      deterministicTraceId: true,
+      userId: 'alice@example.com',
+      metadata: {
+        'librechat.user.role': 'ADMIN',
+        'librechat.conversation.id': 'convo-1',
+        'librechat.endpoint': 'agents',
+        'librechat.provider': 'openAI',
+        'librechat.model': 'gpt-4o',
+        'librechat.spec': 'support-bot',
+      },
+      librechatTraceAttributes: exportTelemetry('central_only', 'fanout_disabled'),
+    });
+  });
+
   it('adds tenant Langfuse credentials from tenant-scoped app config', async () => {
+    process.env.LANGFUSE_FANOUT_ENABLED = 'true';
+    process.env.LANGFUSE_FANOUT_COLLECTOR_URL = 'http://langfuse-fanout-collector:4318';
+
     const callArgs = await callAndCaptureRunConfig({
       tenantId: 'tenant-1',
       appConfig: {
         langfuse: {
+          enabled: true,
           publicKey: 'pk-tenant-1',
-          secretKey: 'sk-tenant-1',
-          baseUrl: 'https://cloud.langfuse.com',
-          fanout: {
-            enabled: true,
-            collectorUrl: 'http://langfuse-fanout-collector:4318',
-          },
+          secretKey: encryptV3('sk-tenant-1'),
+          destination: 'eu',
         },
       } as unknown as AppConfig,
     });
@@ -1212,6 +2573,7 @@ describe('Langfuse run config', () => {
       baseUrl: 'http://langfuse-fanout-collector:4318/tenant/eu',
       metadata: { 'librechat.tenant.id': 'tenant-1' },
       librechatTraceAttributes: {
+        ...exportTelemetry('tenant_fanout', 'configured', 'tenant-1'),
         'librechat.langfuse.tenant_export.enabled': 'true',
         'librechat.langfuse.destination': 'eu',
       },
@@ -1228,9 +2590,10 @@ describe('Langfuse run config', () => {
       tenantId: 'tenant-1',
       appConfig: {
         langfuse: {
+          enabled: true,
           publicKey: 'pk-tenant-1',
-          secretKey: 'sk-tenant-1',
-          baseUrl: 'https://cloud.langfuse.com',
+          secretKey: encryptV3('sk-tenant-1'),
+          destination: 'eu',
         },
       } as AppConfig,
     });
@@ -1240,6 +2603,7 @@ describe('Langfuse run config', () => {
       publicKey: 'pk-central',
       secretKey: 'sk-central',
       baseUrl: 'https://central.langfuse.example',
+      librechatTraceAttributes: exportTelemetry('central_only', 'fanout_disabled', 'tenant-1'),
       metadata: { 'librechat.tenant.id': 'tenant-1' },
       tags: ['tenant:tenant-1'],
     });
@@ -1251,14 +2615,14 @@ describe('Langfuse run config', () => {
     process.env.LANGFUSE_BASE_URL = 'https://central.langfuse.example';
     process.env.LANGFUSE_FANOUT_ENABLED = 'true';
     process.env.LANGFUSE_FANOUT_COLLECTOR_URL = 'http://collector-from-env:4318';
-    process.env.LANGFUSE_FANOUT_TENANT_BASE_URL = 'https://cloud.langfuse.com';
 
     const callArgs = await callAndCaptureRunConfig({
       tenantId: 'tenant-1',
       appConfig: {
         langfuse: {
+          enabled: true,
           publicKey: 'pk-tenant-1',
-          secretKey: 'sk-tenant-1',
+          secretKey: encryptV3('sk-tenant-1'),
         },
       } as AppConfig,
     });
@@ -1266,12 +2630,17 @@ describe('Langfuse run config', () => {
     expect(callArgs.langfuse).toEqual({
       deterministicTraceId: true,
       baseUrl: 'http://collector-from-env:4318',
+      librechatTraceAttributes: exportTelemetry(
+        'central_only',
+        'destination_unconfigured',
+        'tenant-1',
+      ),
       metadata: { 'librechat.tenant.id': 'tenant-1' },
       tags: ['tenant:tenant-1'],
     });
   });
 
-  it('routes tenant fanout traces to the configured destination for the tenant base URL', async () => {
+  it('routes tenant fanout traces to the configured tenant destination', async () => {
     process.env.LANGFUSE_FANOUT_ENABLED = 'true';
     process.env.LANGFUSE_FANOUT_COLLECTOR_URL = 'http://collector-from-env:4318';
 
@@ -1279,9 +2648,10 @@ describe('Langfuse run config', () => {
       tenantId: 'tenant-1',
       appConfig: {
         langfuse: {
+          enabled: true,
           publicKey: 'pk-tenant-1',
-          secretKey: 'sk-tenant-1',
-          baseUrl: 'https://us.cloud.langfuse.com',
+          secretKey: encryptV3('sk-tenant-1'),
+          destination: 'us',
         },
       } as AppConfig,
     });
@@ -1292,6 +2662,7 @@ describe('Langfuse run config', () => {
       baseUrl: 'http://collector-from-env:4318/tenant/us',
       metadata: { 'librechat.tenant.id': 'tenant-1' },
       librechatTraceAttributes: {
+        ...exportTelemetry('tenant_fanout', 'configured', 'tenant-1'),
         'librechat.langfuse.tenant_export.enabled': 'true',
         'librechat.langfuse.destination': 'us',
       },
@@ -1306,9 +2677,10 @@ describe('Langfuse run config', () => {
       tenantId: 'tenant-1',
       appConfig: {
         langfuse: {
+          enabled: true,
           publicKey: 'pk-tenant-1',
-          secretKey: 'sk-tenant-1',
-          baseUrl: 'https://cloud.langfuse.com',
+          secretKey: encryptV3('sk-tenant-1'),
+          destination: 'eu',
         },
       } as AppConfig,
     });
@@ -1328,9 +2700,10 @@ describe('Langfuse run config', () => {
         tenantId: 'tenant-1',
         appConfig: {
           langfuse: {
+            enabled: true,
             publicKey: 'pk-tenant-1',
-            secretKey: 'sk-tenant-1',
-            baseUrl: 'https://us.cloud.langfuse.com',
+            secretKey: encryptV3('sk-tenant-1'),
+            destination: 'us',
           },
         } as AppConfig,
       });
@@ -1340,6 +2713,7 @@ describe('Langfuse run config', () => {
         secretKey: 'sk-tenant-1',
         baseUrl: 'http://collector-from-env:4318/tenant/us',
         librechatTraceAttributes: {
+          ...exportTelemetry('tenant_fanout', 'configured', 'tenant-1'),
           'librechat.langfuse.tenant_export.enabled': 'true',
           'librechat.langfuse.destination': 'us',
         },
@@ -1360,9 +2734,10 @@ describe('Langfuse run config', () => {
         tenantId: 'tenant-1',
         appConfig: {
           langfuse: {
+            enabled: true,
             publicKey: 'pk-tenant-1',
-            secretKey: 'sk-tenant-1',
-            baseUrl: 'https://cloud.langfuse.com',
+            secretKey: encryptV3('sk-tenant-1'),
+            destination: 'eu',
           },
         } as AppConfig,
       });
@@ -1372,6 +2747,7 @@ describe('Langfuse run config', () => {
         publicKey: 'pk-central',
         secretKey: 'sk-central',
         baseUrl: 'https://central.langfuse.example',
+        librechatTraceAttributes: exportTelemetry('central_only', 'fanout_disabled', 'tenant-1'),
         metadata: { 'librechat.tenant.id': 'tenant-1' },
         tags: ['tenant:tenant-1'],
       });
@@ -1389,9 +2765,10 @@ describe('Langfuse run config', () => {
       tenantId: 'tenant-1',
       appConfig: {
         langfuse: {
+          enabled: true,
           publicKey: 'pk-tenant-1',
-          secretKey: 'sk-tenant-1',
-          baseUrl: 'https://cloud.langfuse.com',
+          secretKey: encryptV3('sk-tenant-1'),
+          destination: 'eu',
         },
       } as AppConfig,
     });
@@ -1400,10 +2777,10 @@ describe('Langfuse run config', () => {
       publicKey: 'pk-central',
       secretKey: 'sk-central',
       baseUrl: 'https://central.langfuse.example',
+      librechatTraceAttributes: exportTelemetry('central_only', 'fanout_disabled', 'tenant-1'),
     });
     expect(callArgs.langfuse).not.toMatchObject({
       baseUrl: 'http://collector-from-env:4318/tenant/eu',
-      librechatTraceAttributes: expect.any(Object),
     });
   });
 
@@ -1417,9 +2794,10 @@ describe('Langfuse run config', () => {
       tenantId: 'tenant-1',
       appConfig: {
         langfuse: {
+          enabled: true,
           publicKey: 'pk-tenant-1',
-          secretKey: 'sk-tenant-1',
-          baseUrl: 'https://cloud.langfuse.com',
+          secretKey: encryptV3('sk-tenant-1'),
+          destination: 'eu',
         },
       } as AppConfig,
     });
@@ -1429,12 +2807,17 @@ describe('Langfuse run config', () => {
       publicKey: 'pk-central',
       secretKey: 'sk-central',
       baseUrl: 'https://central.langfuse.example',
+      librechatTraceAttributes: exportTelemetry(
+        'central_only',
+        'collector_unconfigured',
+        'tenant-1',
+      ),
       metadata: { 'librechat.tenant.id': 'tenant-1' },
       tags: ['tenant:tenant-1'],
     });
   });
 
-  it('uses deployment fanout collector URL without auth when the tenant base URL is not a configured destination', async () => {
+  it('uses deployment fanout collector URL without auth when the tenant destination is not configured', async () => {
     process.env.LANGFUSE_PUBLIC_KEY = 'pk-central';
     process.env.LANGFUSE_SECRET_KEY = 'sk-central';
     process.env.LANGFUSE_BASE_URL = 'https://central.langfuse.example';
@@ -1446,9 +2829,10 @@ describe('Langfuse run config', () => {
       tenantId: 'tenant-1',
       appConfig: {
         langfuse: {
+          enabled: true,
           publicKey: 'pk-tenant-1',
-          secretKey: 'sk-tenant-1',
-          baseUrl: 'https://unconfigured-langfuse.example.com',
+          secretKey: encryptV3('sk-tenant-1'),
+          destination: 'unconfigured',
         },
       } as AppConfig,
     });
@@ -1456,6 +2840,11 @@ describe('Langfuse run config', () => {
     expect(callArgs.langfuse).toEqual({
       deterministicTraceId: true,
       baseUrl: 'http://collector-from-env:4318',
+      librechatTraceAttributes: exportTelemetry(
+        'central_only',
+        'destination_unconfigured',
+        'tenant-1',
+      ),
       metadata: { 'librechat.tenant.id': 'tenant-1' },
       tags: ['tenant:tenant-1'],
     });
@@ -1471,13 +2860,14 @@ describe('Langfuse run config', () => {
     const callArgs = await callAndCaptureRunConfig({
       tenantId: 'tenant-1',
       appConfig: {
-        langfuse: {},
+        langfuse: { enabled: true },
       } as AppConfig,
     });
 
     expect(callArgs.langfuse).toEqual({
       deterministicTraceId: true,
       baseUrl: 'http://collector-from-env:4318',
+      librechatTraceAttributes: exportTelemetry('central_only', 'missing_credentials', 'tenant-1'),
       metadata: { 'librechat.tenant.id': 'tenant-1' },
       tags: ['tenant:tenant-1'],
     });
@@ -1497,6 +2887,7 @@ describe('Langfuse run config', () => {
     expect(callArgs.langfuse).toEqual({
       deterministicTraceId: true,
       baseUrl: 'http://collector-from-env:4318',
+      librechatTraceAttributes: exportTelemetry('central_only', 'tenant_disabled', 'tenant-1'),
       metadata: { 'librechat.tenant.id': 'tenant-1' },
       tags: ['tenant:tenant-1'],
     });
@@ -1514,8 +2905,9 @@ describe('Langfuse run config', () => {
       tenantId: 'tenant-1',
       appConfig: {
         langfuse: {
+          enabled: true,
           publicKey: 'pk-tenant-1',
-          secretKey: 'sk-tenant-1',
+          secretKey: encryptV3('sk-tenant-1'),
         },
       } as AppConfig,
     });
@@ -1523,6 +2915,7 @@ describe('Langfuse run config', () => {
     expect(callArgs.langfuse).toEqual({
       deterministicTraceId: true,
       baseUrl: 'http://collector-from-env:4318',
+      librechatTraceAttributes: exportTelemetry('central_only', 'emergency_disabled', 'tenant-1'),
       metadata: { 'librechat.tenant.id': 'tenant-1' },
       tags: ['tenant:tenant-1'],
     });
@@ -1539,9 +2932,10 @@ describe('Langfuse run config', () => {
       tenantId: 'tenant-1',
       appConfig: {
         langfuse: {
+          enabled: true,
           publicKey: 'pk-tenant-1',
-          secretKey: 'sk-tenant-1',
-          baseUrl: 'https://cloud.langfuse.com',
+          secretKey: encryptV3('sk-tenant-1'),
+          destination: 'eu',
         },
       } as AppConfig,
     });
@@ -1554,6 +2948,7 @@ describe('Langfuse run config', () => {
       secretKey: 'sk-tenant-1',
       tags: ['tenant:tenant-1'],
       librechatTraceAttributes: {
+        ...exportTelemetry('tenant_fanout', 'configured', 'tenant-1'),
         'librechat.langfuse.tenant_export.enabled': 'true',
         'librechat.langfuse.destination': 'eu',
       },
@@ -1573,9 +2968,10 @@ describe('Langfuse run config', () => {
         tenantId: 'tenant-1',
         appConfig: {
           langfuse: {
+            enabled: true,
             publicKey: 'pk-tenant-1',
-            secretKey: 'sk-tenant-1',
-            baseUrl: 'https://cloud.langfuse.com',
+            secretKey: encryptV3('sk-tenant-1'),
+            destination: 'eu',
           },
         } as AppConfig,
       });
@@ -1583,6 +2979,7 @@ describe('Langfuse run config', () => {
       expect(callArgs.langfuse).toEqual({
         deterministicTraceId: true,
         baseUrl: 'http://collector-from-env:4318',
+        librechatTraceAttributes: exportTelemetry('central_only', 'emergency_disabled', 'tenant-1'),
         metadata: { 'librechat.tenant.id': 'tenant-1' },
         tags: ['tenant:tenant-1'],
       });
@@ -1602,9 +2999,10 @@ describe('Langfuse run config', () => {
         tenantId: 'tenant-1',
         appConfig: {
           langfuse: {
+            enabled: true,
             publicKey: 'pk-tenant-1',
-            secretKey: 'sk-tenant-1',
-            baseUrl: 'https://cloud.langfuse.com',
+            secretKey: encryptV3('sk-tenant-1'),
+            destination: 'eu',
           },
         } as AppConfig,
       });
@@ -1617,6 +3015,7 @@ describe('Langfuse run config', () => {
         secretKey: 'sk-tenant-1',
         tags: ['tenant:tenant-1'],
         librechatTraceAttributes: {
+          ...exportTelemetry('tenant_fanout', 'configured', 'tenant-1'),
           'librechat.langfuse.tenant_export.enabled': 'true',
           'librechat.langfuse.destination': 'eu',
         },
@@ -1624,103 +3023,49 @@ describe('Langfuse run config', () => {
     },
   );
 
-  it('uses central env Langfuse config when tenant fanout.enabled=false overrides deployment fanout env', async () => {
-    process.env.LANGFUSE_PUBLIC_KEY = 'pk-central';
-    process.env.LANGFUSE_SECRET_KEY = 'sk-central';
-    process.env.LANGFUSE_BASE_URL = 'https://central.langfuse.example';
+  it('keeps central collector tracing when tenant Langfuse export is disabled', async () => {
     process.env.LANGFUSE_FANOUT_ENABLED = 'true';
     process.env.LANGFUSE_FANOUT_COLLECTOR_URL = 'http://collector-from-env:4318';
 
-    const callArgs = await callAndCaptureRunConfig({
-      tenantId: 'tenant-1',
-      appConfig: {
-        langfuse: {
-          publicKey: 'pk-tenant-1',
-          secretKey: 'sk-tenant-1',
-          baseUrl: 'https://cloud.langfuse.com',
-          fanout: {
-            enabled: false,
-          },
-        },
-      } as AppConfig,
-    });
-
-    expect(callArgs.langfuse).toEqual({
-      deterministicTraceId: true,
-      publicKey: 'pk-central',
-      secretKey: 'sk-central',
-      baseUrl: 'https://central.langfuse.example',
-      metadata: { 'librechat.tenant.id': 'tenant-1' },
-      tags: ['tenant:tenant-1'],
-    });
-  });
-
-  it('uses central env Langfuse config when tenant fanout.enabled is the string false', async () => {
-    process.env.LANGFUSE_PUBLIC_KEY = 'pk-central';
-    process.env.LANGFUSE_SECRET_KEY = 'sk-central';
-    process.env.LANGFUSE_BASE_URL = 'https://central.langfuse.example';
-    process.env.LANGFUSE_FANOUT_ENABLED = 'true';
-    process.env.LANGFUSE_FANOUT_COLLECTOR_URL = 'http://collector-from-env:4318';
-
-    const callArgs = await callAndCaptureRunConfig({
-      tenantId: 'tenant-1',
-      appConfig: {
-        langfuse: {
-          publicKey: 'pk-tenant-1',
-          secretKey: 'sk-tenant-1',
-          baseUrl: 'https://cloud.langfuse.com',
-          fanout: {
-            enabled: 'false',
-          },
-        },
-      } as unknown as AppConfig,
-    });
-
-    expect(callArgs.langfuse).toEqual({
-      deterministicTraceId: true,
-      publicKey: 'pk-central',
-      secretKey: 'sk-central',
-      baseUrl: 'https://central.langfuse.example',
-      metadata: { 'librechat.tenant.id': 'tenant-1' },
-      tags: ['tenant:tenant-1'],
-    });
-  });
-
-  it('honors tenant Langfuse enabled=false as a tracing opt-out', async () => {
     const callArgs = await callAndCaptureRunConfig({
       tenantId: 'tenant-1',
       appConfig: {
         langfuse: {
           enabled: false,
           publicKey: 'pk-tenant-1',
-          secretKey: 'sk-tenant-1',
+          secretKey: encryptV3('sk-tenant-1'),
         },
       } as AppConfig,
     });
 
     expect(callArgs.langfuse).toEqual({
       deterministicTraceId: true,
-      enabled: false,
+      baseUrl: 'http://collector-from-env:4318',
+      librechatTraceAttributes: exportTelemetry('central_only', 'tenant_disabled', 'tenant-1'),
       metadata: { 'librechat.tenant.id': 'tenant-1' },
       tags: ['tenant:tenant-1'],
     });
   });
 
-  it('honors tenant Langfuse enabled as the string false', async () => {
+  it('keeps central collector tracing when tenant Langfuse enabled is the string false', async () => {
+    process.env.LANGFUSE_FANOUT_ENABLED = 'true';
+    process.env.LANGFUSE_FANOUT_COLLECTOR_URL = 'http://collector-from-env:4318';
+
     const callArgs = await callAndCaptureRunConfig({
       tenantId: 'tenant-1',
       appConfig: {
         langfuse: {
           enabled: 'false',
           publicKey: 'pk-tenant-1',
-          secretKey: 'sk-tenant-1',
+          secretKey: encryptV3('sk-tenant-1'),
         },
       } as unknown as AppConfig,
     });
 
     expect(callArgs.langfuse).toEqual({
       deterministicTraceId: true,
-      enabled: false,
+      baseUrl: 'http://collector-from-env:4318',
+      librechatTraceAttributes: exportTelemetry('central_only', 'tenant_disabled', 'tenant-1'),
       metadata: { 'librechat.tenant.id': 'tenant-1' },
       tags: ['tenant:tenant-1'],
     });
@@ -1831,6 +3176,44 @@ describe('toolOutputReferences gating', () => {
     expect(callArgs.toolOutputReferences).toEqual({ enabled: true });
   });
 
+  it('enables tool output references from a lazy graph member metadata descriptor', async () => {
+    const signal = new AbortController().signal;
+    const graphMember = makeAgent({
+      id: 'agent_lazy_graph_member',
+      codeEnvAvailable: true,
+      statefulCodeSessions: true,
+    });
+    const lazyChild = {
+      ...makeAgent({ id: 'agent_lazy_child', codeEnvAvailable: false }),
+      configId: 'agent_lazy_child:v1',
+      subagentGraphMemberMetadata: [graphMember],
+      resolve: jest.fn(),
+    };
+    await createRun({
+      agents: [
+        makeAgent({
+          id: 'agent_parent',
+          codeEnvAvailable: false,
+          subagents: { enabled: true, allowSelf: false, agent_ids: ['agent_lazy_child'] },
+          lazySubagentConfigs: [lazyChild],
+        }),
+      ] as never,
+      signal,
+      streaming: true,
+      streamUsage: true,
+    });
+
+    const createMock = Run.create as jest.Mock;
+    const callArgs = createMock.mock.calls[0][0] as Record<string, unknown>;
+    expect(callArgs.toolOutputReferences).toEqual({ enabled: true });
+    /**
+     * Stateful routing is intentionally agent-scoped. A lazy graph member must
+     * not promote its execution profile into run-global SDK configuration.
+     */
+    expect(callArgs.toolExecution).toBeUndefined();
+    expect(lazyChild.resolve).not.toHaveBeenCalled();
+  });
+
   it('terminates and omits toolOutputReferences for a cyclic agent tree with no codeenv', async () => {
     /**
      * Cycle safety: `A → B → A`, neither has `codeEnvAvailable`. The
@@ -1868,9 +3251,8 @@ describe('toolOutputReferences gating', () => {
 // durable checkpoint), so the in-turn `tool_search` results that mark a deferred
 // tool discovered aren't on the critical path. createRun's `discoveredToolNames`
 // input replays those names — captured at pause — so the paused deferred tool is
-// promoted back into `toolDefinitions` (and `defer_loading` flipped) and is present
-// in the rebuilt schema-only toolMap. Without it, the approved tool would be missing
-// and resume would fail with "unknown tool".
+// promoted back into `toolDefinitions` (and `defer_loading` flipped) and its schema
+// is restored to the rebuilt model binding.
 // ---------------------------------------------------------------------------
 describe('createRun deferred-tool replay (HITL resume)', () => {
   /** Agent whose discoverable `deep_tool` lives ONLY in the registry (deferred). */
@@ -2005,6 +3387,49 @@ describe('HITL wiring is gated on hitlCapable', () => {
     const config = await runAndGetConfig({});
     expect(config).not.toHaveProperty('humanInTheLoop');
   });
+
+  it('heals aliases discovered when a lazy subagent resolves', async () => {
+    const alias = { name: 'delete_mcp_acme', aliasName: 'acme_delete_mcp_acme' };
+    const resolvedChild = makeAgent({ id: 'lazy-child', mcpToolAliases: [alias] });
+    const lazyChild = {
+      ...makeAgent({ id: 'lazy-child' }),
+      configId: 'lazy-child:v1',
+      resolve: jest.fn().mockResolvedValue(resolvedChild),
+    };
+    const parent = makeAgent({
+      subagents: { enabled: true, allowSelf: false },
+      lazySubagentConfigs: [lazyChild],
+    });
+    const appConfig = {
+      ...hitlAppConfig,
+      endpoints: {
+        [EModelEndpoint.agents]: {
+          toolApproval: { enabled: true, mode: 'bypass', deny: [alias.aliasName] },
+        },
+      },
+    } as unknown as AppConfig;
+
+    await createRun({
+      agents: [parent] as never,
+      signal: new AbortController().signal,
+      appConfig,
+      streaming: true,
+      streamUsage: true,
+      hitlCapable: true,
+    });
+    const config = (Run.create as jest.Mock).mock.calls[0][0] as Record<string, unknown>;
+    const hooks = config.hooks as { getMatchers: (event: string) => unknown[] };
+    const lazyConfig = (
+      (config.graphConfig as { agents: Array<Record<string, unknown>> }).agents[0]
+        .subagentConfigs as Array<Record<string, unknown>>
+    ).find((entry) => entry.configId === lazyChild.configId);
+
+    expect(hooks.getMatchers('PreToolUse')).toHaveLength(1);
+    await (lazyConfig?.resolveAgentInputs as (context: never) => Promise<unknown>)({
+      signal: new AbortController().signal,
+    } as never);
+    expect(hooks.getMatchers('PreToolUse')).toHaveLength(1);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2049,12 +3474,24 @@ describe('ask_user_question run wiring', () => {
   const firstAgent = (config: Record<string, unknown>) =>
     (config.graphConfig as { agents: Array<Record<string, unknown>> }).agents[0];
 
+  /**
+   * Every run now carries a `PostToolBatch`-only registry for step-budget
+   * awareness, so registry presence no longer proves HITL wiring. What still
+   * distinguishes an approval-gated run is the `PreToolUse` policy hook, and
+   * `PostToolBatch` is deliberately outside the SDK's
+   * `RESULT_ALTERING_HOOK_EVENTS`, so it cannot disable eager tool prestart.
+   */
+  const hasToolApprovalPolicyHook = (config: Record<string, unknown>) =>
+    (config.hooks as { hasHookFor?: (event: string) => boolean } | undefined)?.hasHookFor?.(
+      'PreToolUse',
+    ) === true;
+
   it('attaches the checkpointer WITHOUT humanInTheLoop when hitlCapable and the ask tool is present (approval disabled)', async () => {
     const config = await runAndGetConfig(makeAgent({ tools: [askToolInstance] }), {
       hitlCapable: true,
     });
     expect(config).not.toHaveProperty('humanInTheLoop');
-    expect(config).not.toHaveProperty('hooks');
+    expect(hasToolApprovalPolicyHook(config)).toBe(false);
     expect(getCheckpointer(config)).toBeDefined();
     const agent = firstAgent(config);
     // The tool rides the in-graph direct path (graphTools) — never the
@@ -2235,5 +3672,24 @@ describe('ask_user_question run wiring', () => {
     const config = (Run.create as jest.Mock).mock.calls[0][0] as Record<string, unknown>;
     expect(config.humanInTheLoop).toBeDefined();
     expect(getCheckpointer(config)).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// summarizeOnly resolution (manual compaction)
+// ---------------------------------------------------------------------------
+describe('summarizeOnly resolution', () => {
+  it('is absent on an ordinary run', async () => {
+    const agents = await callAndCapture();
+    expect(agents[0].summarizeOnly).toBeUndefined();
+  });
+
+  it('marks only the primary agent of a compaction run', async () => {
+    const agents = await callAndCapture({
+      agents: [makeAgent({ id: 'agent_primary' }), makeAgent({ id: 'agent_next' })],
+      summarizeOnly: true,
+    });
+    expect(agents[0].summarizeOnly).toBe(true);
+    expect(agents[1].summarizeOnly).toBeUndefined();
   });
 });

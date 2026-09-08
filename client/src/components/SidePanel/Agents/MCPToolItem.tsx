@@ -1,7 +1,8 @@
 import { useState } from 'react';
-import { TooltipAnchor } from '@librechat/client';
-import { Check, Clock, Code2, Info } from 'lucide-react';
+import { Button } from '@librechat/client';
+import { Check, Clock, Code2, Captions, Info, Zap } from 'lucide-react';
 import type { AgentToolType } from 'librechat-data-provider';
+import OptionToggle from './OptionToggle';
 import { useLocalize } from '~/hooks';
 import { cn } from '~/utils';
 
@@ -10,15 +11,24 @@ interface MCPToolItemProps {
   isSelected: boolean;
   isDeferred: boolean;
   isProgrammatic: boolean;
+  isBackground: boolean;
+  isIntent: boolean;
+  /** Intent labels never reach a programmatic-only tool (no card renders for
+   *  calls made from code), so the toggle is shown inert with an explanation. */
+  intentDisabled: boolean;
   deferredToolsEnabled: boolean;
   programmaticToolsEnabled: boolean;
+  programmaticToolsAvailable: boolean;
+  backgroundToolsEnabled: boolean;
+  toolIntentsEnabled: boolean;
   onToggleSelect: () => void;
   onToggleDefer: () => void;
   onToggleProgrammatic: () => void;
+  onToggleBackground: () => void;
+  onToggleIntent: () => void;
 }
 
-const iconButton =
-  'flex size-6 items-center justify-center rounded-md transition-colors hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring-primary';
+const iconButton = 'size-6 rounded-md';
 
 export default function MCPToolItem({
   tool,
@@ -28,8 +38,16 @@ export default function MCPToolItem({
   onToggleSelect,
   isProgrammatic,
   onToggleProgrammatic,
+  isBackground,
+  onToggleBackground,
+  isIntent,
+  intentDisabled,
+  onToggleIntent,
   deferredToolsEnabled,
   programmaticToolsEnabled,
+  programmaticToolsAvailable,
+  backgroundToolsEnabled,
+  toolIntentsEnabled,
 }: MCPToolItemProps) {
   const localize = useLocalize();
   const [expanded, setExpanded] = useState(false);
@@ -54,7 +72,7 @@ export default function MCPToolItem({
             aria-hidden="true"
             className={cn(
               'flex size-4 shrink-0 items-center justify-center rounded border border-border-medium transition-colors',
-              isSelected && 'bg-primary text-primary-foreground',
+              isSelected && 'bg-surface-inverted text-text-inverted',
             )}
           >
             {isSelected && <Check className="size-4" />}
@@ -65,49 +83,56 @@ export default function MCPToolItem({
         </button>
         <div className="flex shrink-0 items-center gap-0.5">
           {deferredToolsEnabled && (
-            <TooltipAnchor
-              description={localize('com_ui_mcp_click_to_defer')}
-              side="top"
-              render={
-                <button
-                  type="button"
-                  onClick={onToggleDefer}
-                  aria-pressed={isDeferred}
-                  aria-label={localize('com_ui_mcp_defer_loading')}
-                  className={cn(
-                    iconButton,
-                    isDeferred ? 'text-amber-500' : 'text-text-secondary hover:text-text-primary',
-                  )}
-                >
-                  <Clock className="size-4" aria-hidden="true" />
-                </button>
-              }
+            <OptionToggle
+              icon={Clock}
+              pressed={isDeferred}
+              label={localize('com_ui_mcp_defer_loading')}
+              tooltip={localize('com_ui_mcp_click_to_defer')}
+              activeBorderClass="border-series-4"
+              onToggle={onToggleDefer}
             />
           )}
           {programmaticToolsEnabled && (
-            <TooltipAnchor
-              description={localize('com_ui_mcp_click_to_programmatic')}
-              side="top"
-              render={
-                <button
-                  type="button"
-                  onClick={onToggleProgrammatic}
-                  aria-pressed={isProgrammatic}
-                  aria-label={localize('com_ui_mcp_programmatic')}
-                  className={cn(
-                    iconButton,
-                    isProgrammatic
-                      ? 'text-violet-500'
-                      : 'text-text-secondary hover:text-text-primary',
-                  )}
-                >
-                  <Code2 className="size-4" aria-hidden="true" />
-                </button>
-              }
+            <OptionToggle
+              icon={Code2}
+              pressed={isProgrammatic}
+              label={localize('com_ui_mcp_programmatic')}
+              tooltip={localize(
+                programmaticToolsAvailable
+                  ? 'com_ui_mcp_click_to_programmatic'
+                  : 'com_ui_mcp_programmatic_requires_code',
+              )}
+              activeBorderClass="border-series-6"
+              disabled={!programmaticToolsAvailable && !isProgrammatic}
+              onToggle={onToggleProgrammatic}
             />
           )}
-          <button
-            type="button"
+          {backgroundToolsEnabled && (
+            <OptionToggle
+              icon={Zap}
+              pressed={isBackground}
+              label={localize('com_ui_mcp_background')}
+              tooltip={localize('com_ui_mcp_click_to_background')}
+              activeBorderClass="border-series-1"
+              onToggle={onToggleBackground}
+            />
+          )}
+          {toolIntentsEnabled && (
+            <OptionToggle
+              icon={Captions}
+              pressed={isIntent}
+              disabled={intentDisabled}
+              label={localize('com_ui_mcp_intent')}
+              tooltip={localize(
+                intentDisabled ? 'com_ui_mcp_intent_programmatic' : 'com_ui_mcp_click_to_intent',
+              )}
+              activeBorderClass="border-series-3"
+              onToggle={onToggleIntent}
+            />
+          )}
+          <Button
+            variant="ghost"
+            size="icon"
             onClick={() => setExpanded((value) => !value)}
             aria-expanded={expanded}
             aria-controls={detailsId}
@@ -118,7 +143,7 @@ export default function MCPToolItem({
             )}
           >
             <Info className="size-4" aria-hidden="true" />
-          </button>
+          </Button>
         </div>
       </div>
       {/* Auto-height reveal via grid-template-rows 0fr -> 1fr so the panel — and

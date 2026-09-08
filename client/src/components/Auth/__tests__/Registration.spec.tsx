@@ -1,10 +1,10 @@
-import reactRouter from 'react-router-dom';
+import * as reactRouter from 'react-router-dom';
 import userEvent from '@testing-library/user-event';
-import { render, waitFor, screen } from 'test/layout-test-utils';
 import * as mockDataProvider from 'librechat-data-provider/react-query';
 import type { TStartupConfig } from 'librechat-data-provider';
-import * as miscDataProvider from '~/data-provider/Misc/queries';
 import * as endpointQueries from '~/data-provider/Endpoints/queries';
+import { render, waitFor, screen } from 'test/layout-test-utils';
+import * as miscDataProvider from '~/data-provider/Misc/queries';
 import * as authMutations from '~/data-provider/Auth/mutations';
 import * as authQueries from '~/data-provider/Auth/queries';
 import Registration from '~/components/Auth/Registration';
@@ -48,6 +48,11 @@ const setup = ({
     isSuccess: false,
     error: null as Error | null,
   },
+  useAxiomSessionQueryReturnValue = {
+    isLoading: false,
+    isError: false,
+    data: { valid: false },
+  },
   useRefreshTokenMutationReturnValue = {
     isLoading: false,
     isError: false,
@@ -68,6 +73,10 @@ const setup = ({
     .spyOn(mockDataProvider, 'useRegisterUserMutation')
     //@ts-ignore - we don't need all parameters of the QueryObserverSuccessResult
     .mockReturnValue(useRegisterUserMutationReturnValue);
+  const mockUseAxiomSessionQuery = jest
+    .spyOn(mockDataProvider, 'useAxiomSessionQuery')
+    //@ts-ignore - we don't need all parameters of the QueryObserverSuccessResult
+    .mockReturnValue(useAxiomSessionQueryReturnValue);
   const mockUseGetUserQuery = jest
     .spyOn(authQueries, 'useGetUserQuery')
     //@ts-ignore - we don't need all parameters of the QueryObserverSuccessResult
@@ -83,7 +92,7 @@ const setup = ({
   const mockUseOutletContext = jest.spyOn(reactRouter, 'useOutletContext').mockReturnValue({
     startupConfig: useGetStartupConfigReturnValue.data,
   });
-  const mockUseGetBannerQuery = jest
+  jest
     .spyOn(miscDataProvider, 'useGetBannerQuery')
     //@ts-ignore - we don't need all parameters of the QueryObserverSuccessResult
     .mockReturnValue(useGetBannerQueryReturnValue);
@@ -106,12 +115,14 @@ const setup = ({
     mockUseOutletContext,
     mockUseGetStartupConfig,
     mockUseRegisterUserMutation,
+    mockUseAxiomSessionQuery,
     mockUseRefreshTokenMutation,
   };
 };
 
 jest.mock('react-router-dom', () => ({
   ...jest.requireActual('react-router-dom'),
+  __esModule: true,
   useOutletContext: () => ({
     startupConfig: mockStartupConfig,
   }),
@@ -120,7 +131,7 @@ jest.mock('react-router-dom', () => ({
 test('renders registration form', () => {
   const { getByText, getByTestId, getByRole } = setup();
   expect(getByText(/Create your account/i)).toBeInTheDocument();
-  expect(getByRole('textbox', { name: /Full name/i })).toBeInTheDocument();
+  expect(getByRole('textbox', { name: /Full name/i })).toHaveClass('h-auto');
   expect(getByRole('form', { name: /Registration form/i })).toBeVisible();
   expect(getByRole('textbox', { name: /Username/i })).toBeInTheDocument();
   expect(getByRole('textbox', { name: /Email/i })).toBeInTheDocument();
